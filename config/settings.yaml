@@ -1,0 +1,263 @@
+# SPLATT OPS SETTINGS
+#
+# Every port, path, id and interval in the system lives here, so no module
+# hardcodes one. Code reads values by dotted key through core/config.py,
+# for example conf.get("overdue.stall_after_days").
+#
+# Secrets do NOT live here. They live in the .env file at the root of the
+# repo (copy .env.example). This file only names the environment variable
+# each secret is read from, so it is safe to commit. See docs/INSTALL.md.
+
+meta:
+  version: 1
+  last_reviewed: 2026-08-08
+  # The business's local timezone. It decides where a day starts and ends,
+  # so "finished today" on the daily summary means the local day rather
+  # than the UTC day, which in New Zealand is 12 or 13 hours different.
+  timezone: Pacific/Auckland
+
+# PocketBase
+pocketbase:
+  url: http://127.0.0.1:8090
+  # If the environment variable named here is set (in .env or the shell),
+  # its value is used instead of `url`, for example when PocketBase runs
+  # on another machine.
+  url_env_override: SPLATT_PB_URL
+  admin_email_env: PB_ADMIN_EMAIL
+  admin_password_env: PB_ADMIN_PASSWORD
+  timeout_seconds: 15
+  # Check every write against core/schema.py before sending it, so an
+  # unknown field or an invalid select value is refused locally.
+  enforce_schema: true
+
+# Playbook harness
+# The Node server (server/project-files-server.js) that serves playbook
+# specs and records playbook runs.
+playbook:
+  url: http://127.0.0.1:8092
+  url_env_override: SPLATT_PLAYBOOK_URL
+  specs_dir: SS Folders/_howtotasks/playbooks
+  runs_dir: SS Folders/_howtotasks/runs
+  timeout_seconds: 15
+
+# Todoist
+todoist:
+  token_env: TODOIST_API_TOKEN
+  # The project and section ids are blank in the repository. They are
+  # filled in during install by running `python -m tools.todoist_setup`
+  # (with --write --save it creates the board and writes the ids here),
+  # see docs/INSTALL.md. The overdue engine refuses to run while any
+  # section it moves tasks into is blank, and names the missing ones.
+  project_id: ""
+  # The name tools/todoist_setup.py looks for, or creates.
+  project_name: Splatt Ops
+  # The board. Each section is a column, and the column a task is in is
+  # its state, so the board answers "whose move is it" at a glance.
+  sections:
+    today: ""
+    overdue: ""
+    upcoming: ""
+    waiting_client: ""
+    waiting_supplier: ""
+    stalled: ""
+    backlog: ""
+  timeout_seconds: 15
+
+# Telegram
+# Two channels. `general` carries day-to-day client and job messages.
+# `ops` carries validator and daemon health messages, so they are not
+# lost among normal traffic.
+telegram:
+  general:
+    token_env: TELEGRAM_BOT_TOKEN
+    chat_id_env: TELEGRAM_CHAT_ID
+  ops:
+    token_env: TELEGRAM_BOT_TOKEN_OPS
+    chat_id_env: TELEGRAM_CHAT_ID_OPS
+  timeout_seconds: 15
+
+# Paths
+# Relative paths are resolved against paths.root. Set SPLATT_ROOT (in .env
+# or the shell) to use a different root without editing this file.
+#
+# Client project folders sit directly inside SS Folders, one folder per
+# client, so `projects` and `ss_folders` point at the same place.
+paths:
+  root: ~/Documents/Splatt
+  root_env_override: SPLATT_ROOT
+  ss_folders: SS Folders
+  projects: SS Folders
+  suppliers: SS Folders/_Suppliers
+  planning: SS Folders/_Planning
+  howtotasks: SS Folders/_howtotasks
+  # Written by this repo, never committed.
+  state: state
+  reports: reports
+  logs: logs
+
+# Daemon
+daemon:
+  poll_interval_seconds: 60
+  # Log rotation: each log file is capped at 10 MB, keeping 5 old files.
+  log_max_bytes: 10485760
+  log_backup_count: 5
+  # If a cycle raises, wait this long before the next one.
+  error_backoff_seconds: 300
+  # How long a sync_log record is kept before the prune deletes it.
+  sync_log_keep_days: 30
+  # The most records one prune run will delete. A large backlog is then
+  # cleared over several runs instead of one unbounded delete loop.
+  # Reaching the cap is reported, and the next run continues from there.
+  sync_log_max_deletes: 5000
+
+# Validator
+validator:
+  rules_file: config/validation-rules.yaml
+  # Informational. The review window the validator actually applies is
+  # meta.review_after_days in the rules file (rules_are_fresh warns on
+  # rules older than that). Keep the two equal.
+  rule_review_after_days: 180
+  # Where the human readable run report is written.
+  report_dir: reports
+  # How long a bypass stays valid. After this the waived check applies again.
+  bypass_ttl_hours: 72
+  # The daemon loop runs the validator itself once the ops channel has
+  # been quiet for this many hours. Measured since the last accepted ops
+  # message rather than the last run, so a run whose Telegram send failed
+  # is retried.
+  #
+  # Keep this below notifications.silence_is_a_fault.max_quiet_hours in
+  # the rules file, otherwise the silence alert fires before the loop has
+  # had a chance to run the validator. Set to 0 to disable automatic runs.
+  auto_run_interval_hours: 12
+
+# Overdue engine
+# What happens to a task that is past its due date (daemon/overdue.py).
+#
+# Every number below is measured from the REAL due date: the date pinned
+# in the header of the task description and mirrored in PocketBase. It is
+# never measured from the parked date in Todoist, because the engine
+# rewrites that on every sweep, so it is always about one day old.
+overdue:
+  # Days past the real due date before each step fires.
+  reschedule_after_days: 1
+  escalate_after_days: 3
+  alert_after_days: 7
+  # Warning only. The task is labelled and told when it will stall, and
+  # stays where it is, because a task two weeks late is often still live.
+  stall_warning_days: 14
+  # Moved to Stalled, due date cleared, left alone.
+  stall_after_days: 28
+  # Label put on anything the engine escalates. Filter on @escalated in
+  # Todoist to see everything past three days in one list.
+  escalated_label: escalated
+  # Label put on a task during its warning period.
+  stall_warning_label: stall-warning
+  # Colour only, see the priority section at the end of this file. Written
+  # the way Todoist shows them, where P1 is the top; the API numbers them
+  # the other way round and the code converts.
+  colours:
+    today: p1
+    overdue: p2
+    waiting: p3
+    stalled: p4
+  # Used by the daily summary (daemon/summary.py) to count tasks that have
+  # been auto-rescheduled this many times and need a decision. Lateness
+  # itself is measured from the real due date, not from this count.
+  max_auto_reschedules: 3
+
+# Planner
+# Time-of-day arithmetic for scheduling work (core/planner.py).
+planner:
+  # Overdue work is parked at this time on the previous day. Midnight is
+  # never planned time, so a full Overdue column does not collide with
+  # work the operator scheduled.
+  park_time: "00:00"
+  # The working day that chase tasks may be booked into.
+  working_hours:
+    start: 8
+    end: 17
+  # Gap left either side of a booked task, where the day allows it.
+  buffer_minutes: 15
+  # How many days ahead to look for a free slot before giving up and
+  # asking the operator. A task is never booked on top of another.
+  search_days: 14
+  skip_weekends: true
+
+# Waiting
+# Separates work that is late on the operator's side from work waiting on
+# someone else (daemon/waiting.py). Waiting tasks are chased, not escalated.
+waiting:
+  # A client chase waits longer than a supplier chase, which is usually a
+  # one-line logistics email.
+  client_chase_business_days: 5
+  supplier_chase_business_days: 3
+  # After this many chases with no reply the task moves to Stalled rather
+  # than being chased indefinitely.
+  max_chases: 2
+
+# Task state triggers
+# Completing a task moves its job to the status the task names
+# (core/triggers.py).
+#
+# Every number and pattern the trigger engine reads is here, so a wrong
+# pattern is a config change rather than a code change. The engine falls
+# back to the same values in code when this block is missing, so tests do
+# not need a settings file.
+triggers:
+  # How long a quoted job waits before the engine writes one chase task.
+  # Measured from jobs.status_changed_at, never from created or updated.
+  # Any edit to a record moves updated, so a quote sent three weeks ago
+  # whose value was corrected yesterday would otherwise look one day old.
+  quoted_chase_after_days: 7
+  # The line a job moves along. A trigger may move a job forward along it,
+  # never back, and a job already at or past the target is left alone.
+  #
+  # Statuses not on this list cannot be reached by a trigger. on_hold,
+  # commissioning, reengage, lost and cancelled are decisions with a
+  # reason behind them, and completing a task is not such a reason.
+  # completed sits past the end, so a trigger aimed at it has nothing to do.
+  forward_order: [quoting, quoted, won, invoicing, invoiced]
+  # Title patterns rule R0 uses to give a task a trigger it should already
+  # have.
+  #
+  # Strict on purpose, and both halves must agree: the title matches AND
+  # the job is in the status the move starts from. "Send the quote" on a
+  # job that is already won says nothing about quoting.
+  #
+  # Every trigger added this way is reported in Telegram and written to the
+  # client history, so a pattern that guesses wrong is visible. Tasks the
+  # patterns miss get their trigger from the agent when it creates them,
+  # which is the normal path.
+  title_patterns:
+    quoted:
+      when_status: quoting
+      patterns:
+        - "Send (the )?quote"
+        - "Send .* quote"
+    won:
+      when_status: quoted
+      patterns:
+        - "Confirm (the )?PO"
+        - "Receive (the )?PO"
+        - "Confirm (the )?order"
+    invoicing:
+      when_status: won
+      patterns:
+        - "Raise (the )?invoice"
+        - "Invoice .* for"
+    invoiced:
+      when_status: invoicing
+      patterns:
+        - "Send (the )?invoice"
+
+# Priority
+# Priority is a visual aid only: a colour, not a state. No routing
+# decision, validator rule or filter in this codebase reads it back. The
+# column a task sits in is the only source of truth, and
+# tests/test_no_priority_logic.py enforces that.
+priority:
+  # Reserved switch, off. When on, the engine would repaint leftover P1
+  # tasks to match their column overnight. It stays off because that would
+  # treat colour as state and override colours the operator set by hand.
+  autotidy: false

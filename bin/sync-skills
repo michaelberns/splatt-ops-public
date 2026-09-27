@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+#
+# bin/sync-skills: copy the skills in this repo into the folder Claude loads
+# them from (~/.claude/skills), then register them in PocketBase.
+#
+#   bin/sync-skills            copy every skill, register, then verify
+#   bin/sync-skills a b c      copy only these skills
+#   bin/sync-skills --check    say what would change, copy nothing
+#
+# Why it exists
+#   The working copy of every skill lives in skills/, beside the code it
+#   describes, so instructions and code change in the same commit. Claude,
+#   however, reads skills from ~/.claude/skills, and nothing else copies
+#   them there. Without this step an edited skill would be committed while
+#   the agent kept running the previous version.
+#
+# What it does, in order
+#   1. rsync each skill folder (not only SKILL.md, because a skill's
+#      scripts/ folder changes too) into ~/.claude/skills/<name>/, deleting
+#      files that no longer exist in the repo.
+#   2. Run `python -m tools.skill_harness sync-all`, which records each
+#      skill's hash and metadata in PocketBase for the dashboard and the
+#      skill harness. It copies no files, and it needs the stack running.
+#   3. Read each SKILL.md back from ~/.claude/skills and compare it with the
+#      repo copy, so a copy that reported success but did not land is
+#      caught.
+#
+# Exit code 0 when every skill matches, 1 when anything failed, 2 on a bad
+# option or when ~/.claude/skills does not exist.
+
+set -uo pipefail
+
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+LIVE="$HOME/.claude/skills"
+SRC="$REPO/skills"
+
+CHECK=0
+NAMES=()
+for arg in "$@"; do
+    case "$arg" in
+        --check) CHECK=1 ;;
+        -*) echo "unknown option $arg" >&2; exit 2 ;;
+        *) NAMES+=("$arg") ;;
+    esac
+done
+
+if [ "${#NAMES[@]}" -eq 0 ]; then
+    for path in "$SRC"/*/; do
+        [ -f "$path/SKILL.md" ] && NAMES+=("$(basename "$path")")
+    done
+fi
+
+if [ ! -d "$LIVE" ]; then
+    echo "  $LIVE does not exist."
+    echo "  This script only works on a machine where Claude is installed."
+    exit 2
+fi
+
+echo ""
+echo "  Splatt Engineering"
+echo "  Skills from $SRC"
+echo "  into        $LIVE"
+echo ""
+
+FAILED=0
+for name in "${NAMES[@]}"; do
+    from="$SRC/$name/"
+    if [ ! -f "$from/SKILL.md" ]; then
+        echo "  SKIP    $name, no SKILL.md in the repo"
+        continue
+    fi
+    if [ "$CHECK" -eq 1 ]; then
+        changed="$(rsync -an --delete --exclude __pycache__ --out-format='%n' \
+            "$from" "$LIVE/$name/" 2>/dev/null | grep -v '/$' | head -20)"
+        if [ -z "$changed" ]; then
+            echo "  same    $name"
+        else
+            echo "  differs $name"
+            printf '            %s\n' $changed
+        fi
+        continue
+    fi
+    mkdir -p "$LIVE/$name"
+    if rsync -a --delete --exclude __pycache__ "$from" "$LIVE/$name/"; then
+        echo "  copied  $name"
+    else
+        echo "  FAILED  $name"
+        FAILED=1
+    fi
+done
+
+if [ "$CHECK" -eq 1 ]; then
+    echo ""
+    echo "  Nothing was copied. Run again without --check to apply this."
+    exit 0
+fi
+
+echo ""
+echo "  Registering the skills and their refs in PocketBase."
+if ! (cd "$REPO" && python3 -m tools.skill_harness sync-all); then
+    echo ""
+    echo "  The harness could not register them. That is a separate step from"
+    echo "  the copy above, it needs the stack running, and its failure says"
+    echo "  nothing about whether the files landed. Start the stack and run:"
+    echo "      cd $REPO && python3 -m tools.skill_harness sync-all"
+    FAILED=1
+fi
+
+# Read each SKILL.md back rather than trusting rsync's exit code.
+echo ""
+echo "  Reading back what is now live:"
+for name in "${NAMES[@]}"; do
+    live_file="$LIVE/$name/SKILL.md"
+    if [ ! -f "$live_file" ]; then
+        echo "  MISSING $name/SKILL.md is not there after the copy"
+        FAILED=1
+        continue
+    fi
+    if cmp -s "$SRC/$name/SKILL.md" "$live_file"; then
+        echo "  matches $name/SKILL.md"
+    else
+        echo "  DIFFERS $name/SKILL.md is not the same as the repo copy"
+        FAILED=1
+    fi
+done
+
+echo ""
+if [ "$FAILED" -eq 0 ]; then
+    echo "  Done. Every skill on disk matches the repo."
+else
+    echo "  Finished with problems. Read the lines above before trusting it."
+fi
+exit "$FAILED"

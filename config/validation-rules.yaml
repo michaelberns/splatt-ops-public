@@ -1,0 +1,854 @@
+# SPLATT OPS VALIDATION RULES
+#
+# The complete definition of what the validator (validator/) checks.
+# Adding a check means adding a rule here. Python is only needed for a new
+# named check or a new requirement type. Every field a rule names exists
+# in core/schema.py.
+#
+# Sections
+#   A. standing       checks that run on every pass. Each names a function
+#                     in validator/checks/standing.py with `check:`.
+#   B. gates          state gates. Each guards a job status
+#                     (`on_transition_to`) or a boolean flag on the job
+#                     (`on_flag_true`) and lists what must be true under
+#                     `requires:` (types in validator/checks/requirements.py).
+#                     Evaluated against every non-archived job on every pass.
+#   C. money          money gates: freight and supplier costs are recharged
+#                     and bills are linked to a job. None can be bypassed.
+#   D. actions        Telegram messages sent during a run
+#   E. notifications  channel routing and the silence_is_a_fault heartbeat
+#
+# severity
+#   block  the agent may not report success until it is resolved
+#   warn   the agent may report success but must mention it
+#
+# bypassable
+#   true   the operator may waive a failure with
+#          `python -m validator bypass <id> --reason "..."`. The reason is
+#          recorded and the waiver expires after validator.bypass_ttl_hours
+#          (config/settings.yaml).
+#   false  cannot be waived and cannot carry a temporary exception. Used
+#          where money or a document would be lost.
+#
+# Other keys on a rule
+#   version          bumped when the rule's meaning changes
+#   last_reviewed    when a person last reviewed the rule. rules_are_fresh
+#                    warns once this is older than meta.review_after_days.
+#   description      printed in the report above the rule's failures
+#   notes            printed in the report after the rule's failures
+#   on_fail.message  replaces the default one-line failure summary
+#
+# Temporary exceptions
+#   A bypassable rule may carry an `exception:` block (until, severity,
+#   reason) that runs it at a softer severity until a date at most 90 days
+#   ahead, with a reason of at least 25 characters. The rule reverts to its
+#   declared severity automatically the day after. See validator/rules.py.
+#   No exception is active in this file.
+
+meta:
+  version: 6
+  last_reviewed: 2026-09-10
+  review_after_days: 180
+  schema_source: core/schema.py generated from live PocketBase 2026-09-10
+  change_log:
+    - date: 2026-09-10
+      version: 6
+      change: gate_quoted lowered from block to warn. gate_invoiced stays block and not bypassable.
+    - date: 2026-09-10
+      version: 5
+      change: Added eight rules for the task state triggers (completed_trigger_landed blocks, the other seven warn).
+    - date: 2026-08-13
+      version: 4
+      change: on_block throttled like on_warn, and on_block_summary added.
+    - date: 2026-08-13
+      version: 3
+      change: Added the actions (on_start, on_pass, on_complete, throttled on_warn) and notification routing with the silence_is_a_fault heartbeat.
+
+# A. STANDING CHECKS
+# Run on every validation pass, at the end of an agent run and on the
+# daemon's scheduled runs.
+standing:
+
+  - id: writes_landed
+    version: 2
+    last_reviewed: 2026-08-08
+    description: >
+      Every record this run claims it created or updated is re-read from
+      PocketBase and confirmed present, with the fields it claimed to set
+      actually non empty. The claims come from the write ledger, so a
+      caller cannot opt out of being checked.
+    severity: block
+    bypassable: false
+    check: reread_claimed_writes
+    notes: >
+      Claims are appended to state/writes.jsonl by core/ledger.py
+      (RecordingClient wraps the PocketBase client). Claimed Todoist moves
+      are confirmed against Todoist instead of PocketBase.
+
+  - id: schema_drift
+    version: 2
+    last_reviewed: 2026-08-08
+    description: >
+      Live PocketBase collection fields match core/schema.py exactly.
+      Any field the code writes that does not exist in the collection is
+      a failure, and so is any collection that has gained or lost a field
+      since schema.py was generated.
+    severity: block
+    bypassable: false
+    check: compare_schema_to_live
+    notes: >
+      PocketBase rejects or drops fields a collection does not have, so a
+      mismatch here means some writes are failing or losing data. After
+      changing a collection, regenerate schema.py with
+      `python -m tools.introspect_schema --write` and review the diff.
+
+  - id: todoist_pb_agree
+    version: 2
+    last_reviewed: 2026-08-08
+    description: >
+      Every open task in the Splatt Todoist project has an assignment
+      record in PocketBase. Every open assignment points at a Todoist task
+      that still exists.
+    severity: block
+    bypassable: true
+    check: reconcile_todoist_assignments
+    tolerance:
+      grace_seconds: 120
+
+  - id: no_orphan_assignments
+    version: 2
+    last_reviewed: 2026-08-08
+    description: >
+      No open assignment whose content names a known client is left with
+      an empty client field. Matching is against the name and aliases
+      fields of the PocketBase clients collection.
+    severity: warn
+    bypassable: true
+    check: assignment_client_links
+    notes: >
+      Aliases shorter than three characters are ignored, so they do not
+      match inside unrelated words.
+
+  - id: assignments_filed_under_a_project
+    version: 1
+    last_reviewed: 2026-09-01
+    description: >
+      Every open assignment is either linked to a project, or has a
+      reason it cannot be. A task whose client has live projects but
+      whose title names none of them is raised, and so is a task where
+      two projects match equally well and the matcher refused to pick.
+      Tasks with no client, and tasks whose client has no live project,
+      are counted and stated rather than failed.
+    severity: warn
+    bypassable: true
+    check: assignment_job_links
+    notes: >
+      daemon/sync.py links a task to a project when it arrives, using
+      core/jobmatch.py. This rule lists the tasks the matcher could not
+      place, so an unfiled task is visible in the report.
+
+  - id: no_orphan_interactions
+    version: 3
+    last_reviewed: 2026-08-08
+    description: >
+      Every interaction record links to a client or a supplier that
+      exists. Either one counts. An email about a freight forwarder is
+      not an orphan just because the forwarder is a supplier, not a client.
+    severity: block
+    bypassable: true
+    check: interaction_client_links
+    notes: >
+      Interactions are written through core/interactions.save, which keys
+      on source_key, and PocketBase has a unique index on that field, so a
+      duplicate is refused by the database even if the code is wrong.
+
+  - id: no_orphan_quotes
+    version: 1
+    last_reviewed: 2026-08-08
+    description: >
+      Every non archived quote links to a job. A quote with no job cannot
+      be counted in pipeline and cannot satisfy the quoted gate.
+    severity: warn
+    bypassable: true
+    check: quote_job_links
+
+  - id: no_orphan_invoices
+    version: 1
+    last_reviewed: 2026-08-08
+    description: >
+      Every invoice links to a job and a client. An invoice with no job is
+      revenue that will never show against the work that earned it.
+    severity: warn
+    bypassable: true
+    check: invoice_job_links
+
+  - id: invoicing_job_has_an_invoice
+    version: 1
+    last_reviewed: 2026-09-10
+    description: >
+      Every non archived job with status invoicing has at least one
+      record in invoices linking to it. gate_invoicing only checks that
+      the job has a client and a value, and gate_invoiced only applies
+      once the job reaches invoiced, so this rule covers a job sitting in
+      invoicing with no invoice record. The evidence line shows how many
+      bills link to the job but never fails on missing bills, because
+      labour and service jobs have no supplier cost. The wording is "no
+      invoice record found" rather than "not invoiced", because invoices
+      come from two Xero organisations with overlapping numbers and the
+      invoice may exist in the other one.
+    severity: warn
+    bypassable: true
+    check: invoicing_job_has_an_invoice
+    notes: >
+      Read only. It lists jobs and never creates records, changes a
+      status or contacts Xero.
+
+  - id: no_dangling_playbook_runs
+    version: 2
+    last_reviewed: 2026-08-08
+    description: >
+      No playbook run opened during this cycle is still open at the end of
+      it. A dangling run blocks future runs of the same playbook.
+    severity: block
+    bypassable: true
+    check: playbook_runs_closed
+
+  - id: promises_are_guarded
+    version: 2
+    last_reviewed: 2026-08-08
+    description: >
+      Every client promise recorded in a PROJECT.md (a line such as "will
+      send the revised quote by Friday" under one of the sections below)
+      carries a Todoist task id matching 6[a-zA-Z0-9]{15}, and that task
+      still exists, so every promise has a task that will surface it.
+    severity: block
+    bypassable: false
+    check: promise_task_guard
+    options:
+      # Only these sections are scanned. A correspondence log records what
+      # was said in the past rather than open work, so it is left out.
+      sections:
+        - change log
+        - open items
+        - active client-side actions
+        - timeline
+        - supplier outreach tracker
+
+  # These five read the Todoist board only. None of them looks at a task's
+  # priority, which is a colour the operator may change by hand; the
+  # column a task is in is its state.
+  - id: overdue_not_stalled
+    version: 2
+    last_reviewed: 2026-08-30
+    description: >
+      No task sits in the Overdue column past overdue.stall_after_days
+      measured from its REAL due date (the date pinned in the task
+      description, not the parked date Todoist displays). Past that the
+      task belongs in Stalled.
+    severity: warn
+    bypassable: false
+    check: overdue_not_stalled
+
+  - id: real_due_is_pinned
+    version: 2
+    last_reviewed: 2026-09-05
+    description: >
+      Every task in Overdue, in either Waiting column, or in Stalled
+      states the date it was really due in the header of its description
+      (the lines at the top written by this system, above the body).
+      Without it the next sweep sees only the parked date and treats an
+      old task as one day late.
+    severity: block
+    bypassable: false
+    check: real_due_is_pinned
+
+  - id: real_due_not_duplicated
+    version: 1
+    last_reviewed: 2026-09-05
+    description: >
+      No task carries two pinned lines. Two means a new pin was written
+      above an existing one, so the recorded date and a second date are
+      both on the task and the write-once rule has been broken. The next
+      write repairs it; this rule reports that it happened.
+    severity: block
+    bypassable: false
+    check: real_due_not_duplicated
+
+  - id: real_due_mirror_agrees
+    version: 1
+    last_reviewed: 2026-09-05
+    description: >
+      Every pinned task has the same real due date stored on its
+      PocketBase assignment. The mirror is the durable copy, because a
+      Todoist description can be overwritten by hand, so an empty or
+      different mirror is reported.
+    severity: warn
+    bypassable: false
+    check: real_due_mirror_agrees
+
+  - id: stalled_has_no_date
+    version: 1
+    last_reviewed: 2026-08-30
+    description: >
+      No task in the Stalled column has a due date. A dateless task
+      cannot appear in Today, in Upcoming, or in any overdue filter,
+      which keeps abandoned work out of the daily view without deleting
+      it. The real due date is still on the pinned line.
+    severity: block
+    bypassable: false
+    check: stalled_has_no_date
+
+  # The task state triggers: finishing a task moves its job to the status
+  # named in the task (core/triggers.py). Eight rules, because the
+  # mechanism changes job statuses and creates tasks on its own.
+  - id: trigger_line_matches_record
+    version: 1
+    last_reviewed: 2026-09-10
+    description: >
+      On every open task the "On complete: job to x" line in the Todoist
+      description and the on_complete_job_status field on the assignment
+      say the same thing. Two copies on purpose, the same arrangement as
+      the real due date: the line is what a person reads and can
+      overwrite by accident, the field is the durable one and wins. An
+      empty field under a line that is there is reported, because until
+      the mirror exists the trigger cannot fire.
+    severity: warn
+    bypassable: true
+    check: trigger_line_matches_record
+    notes: >
+      Expect a few entries after new tasks are created: the agent writes
+      the line when it creates a task, and the field is filled on the
+      next trigger pass.
+
+  - id: trigger_tasks_link_a_job
+    version: 1
+    last_reviewed: 2026-09-10
+    description: >
+      Every open assignment carrying on_complete_job_status is linked to
+      a project. Without a project the trigger can never fire: when the
+      task is completed the engine refuses it on every pass.
+    severity: warn
+    bypassable: true
+    check: trigger_tasks_link_a_job
+
+  - id: quote_tasks_carry_a_trigger
+    version: 1
+    last_reviewed: 2026-09-10
+    description: >
+      Every open task whose title matches one of the strict patterns in
+      settings under triggers.title_patterns, for its project's current
+      status, carries the matching on_complete_job_status. Assigning
+      these is the job of R0, the first rule of the trigger pass.
+    severity: warn
+    bypassable: true
+    check: quote_tasks_carry_a_trigger
+    notes: >
+      Reads the same patterns the engine reads. The question is whether
+      the engine acted on its patterns, not whether the patterns are right.
+
+  - id: trigger_change_was_logged
+    version: 1
+    last_reviewed: 2026-09-10
+    description: >
+      Every job whose status_changed_by starts with "task:" has an
+      interaction recording the move against that job, so every automatic
+      status change appears as a plain sentence in the client history.
+    severity: warn
+    bypassable: true
+    check: trigger_change_was_logged
+
+  - id: completed_trigger_landed
+    version: 1
+    last_reviewed: 2026-09-10
+    description: >
+      Every task completed in the last 14 days that carries a trigger
+      has its project at or past that status. The refusals the engine is
+      supposed to make are excluded by name and counted rather than
+      failed: an archived project, a sensitive account, a status off the
+      forward line, invoiced with no invoice record, and no project link
+      at all, which trigger_tasks_link_a_job owns.
+    severity: block
+    bypassable: true
+    check: completed_trigger_landed
+    notes: >
+      A trigger that did nothing leaves a completed task that looks
+      handled while the job has not moved. The exclusions are read from
+      PocketBase by the check itself rather than taken from the engine,
+      so the check can still catch the engine being wrong.
+
+  - id: quoted_jobs_have_a_chase
+    version: 1
+    last_reviewed: 2026-09-10
+    description: >
+      Every job quoted for triggers.quoted_chase_after_days or longer
+      and still sitting in quoted has a chase task, open or completed.
+      Once one exists this rule stops caring, because from that moment
+      the waiting engine owns the chasing and its own rules apply.
+    severity: warn
+    bypassable: true
+    check: quoted_jobs_have_a_chase
+    notes: >
+      Jobs on a sensitive account are counted and stated, never failed.
+      The engine does not chase them either.
+
+  - id: no_orphan_chase_tasks
+    version: 1
+    last_reviewed: 2026-09-10
+    description: >
+      No open chase task belongs to a project that has left quoted.
+      Closing it is the job of R3, the clean-up rule of the trigger pass.
+    severity: block
+    bypassable: true
+    check: no_orphan_chase_tasks
+    notes: >
+      Blocks rather than warns because an open chase on a job that has
+      been won, invoiced or lost would ask the client about a decision
+      they have already made.
+
+  - id: job_status_change_is_stamped
+    version: 1
+    last_reviewed: 2026-09-10
+    description: >
+      Every non archived job records when its status last moved. Without
+      it the seven day chase clock has nothing to run from, and both
+      alternatives are wrong: created is the day the job was opened, and
+      updated moves whenever anybody edits a note.
+    severity: warn
+    bypassable: true
+    check: job_status_change_is_stamped
+    notes: >
+      tools/backfill_status_changed fills this in once for existing jobs.
+      After that it is written by whatever makes the change.
+
+  - id: rules_are_fresh
+    version: 1
+    last_reviewed: 2026-08-08
+    description: >
+      No rule in this file is older than meta.review_after_days, so the
+      rules are known to be current rather than assumed to be.
+    severity: warn
+    bypassable: false
+    check: rules_freshness
+
+# B. STATE GATES
+# Each gate lists what must be true for a job in a given state. Gates are
+# evaluated against every non-archived job on every pass, not only at the
+# moment a status changes, so a job stays reported until it is fixed.
+#
+# The eleven job statuses, in flow order. The list is held in
+# core/job_status.py and in JOB_STATUS_META in dashboard/index.html, and
+# tests/test_job_status.py fails if they disagree:
+#   quoting quoted won invoicing invoiced commissioning
+#   lost on_hold cancelled completed reengage
+#
+# `paid` is not a status. Payment is recorded on the job's paid flag
+# (with paid_amount and paid_at), so gate_paid uses on_flag_true.
+#
+# A gate says what it guards with on_transition_to (one status, a list, or
+# `any`), or with on_flag_true for a claim that is a boolean field.
+gates:
+
+  - id: gate_quoted
+    version: 4
+    last_reviewed: 2026-09-10
+    on_transition_to: quoted
+    description: A job is not quoted until the quote exists as a record and as a filed document.
+    # warn, not block. A completed "send the quote" task can move a job to
+    # quoted (core/triggers.py), often before the document is filed, and
+    # blocking there would fail the run behind that move. The gap is still
+    # reported here and shown as a NO QUOTE chip on the dashboard. Invoices
+    # are treated more strictly: gate_invoiced blocks and cannot be bypassed.
+    severity: warn
+    bypassable: true
+    requires:
+      - type: related_record_exists
+        collection: quotes
+        match: { job: "$job.id" }
+        where: "archived != true"
+      # Word files count as well as PDFs. Supplier quotes are filed exactly
+      # as received, for example "Cyclone-HFD-26SPQT0001-Quote.doc" or
+      # "AS - Aquaform Service Estimate.docx". The question is whether the
+      # quote can be opened from the project folder, and a .doc answers it.
+      # A job with no quote document at all still fails.
+      - type: file_in_project_folder
+        patterns:
+          - "*QU*.pdf"
+          - "*quote*.pdf"
+          - "*Quote*.pdf"
+          - "*QU*.doc"
+          - "*QU*.docx"
+          - "*quote*.doc"
+          - "*quote*.docx"
+          - "*Quote*.doc"
+          - "*Quote*.docx"
+          - "*Estimate*.doc"
+          - "*Estimate*.docx"
+        modified_after: job.start_date
+    on_fail:
+      message: "Job moved to quoted but no quote record links to it, or no quote document is filed."
+
+  - id: gate_won
+    version: 2
+    last_reviewed: 2026-08-08
+    on_transition_to: won
+    description: Client said yes, so there must be something showing they said yes.
+    severity: block
+    bypassable: true
+    requires:
+      - type: gate_passed
+        gate: gate_quoted
+      - type: any_of
+        options:
+          - type: related_record_exists
+            collection: quotes
+            match: { job: "$job.id" }
+            where: "status = 'accepted'"
+          - type: file_in_project_folder
+            patterns: ["*PO*.pdf", "*acceptance*", "*approval*"]
+          - type: interaction_exists
+            filter: "type = 'email'"
+            since: transition_time
+
+  - id: gate_invoicing
+    version: 2
+    last_reviewed: 2026-08-08
+    on_transition_to: invoicing
+    description: You cannot invoice a job with no client and no value.
+    severity: warn
+    bypassable: true
+    requires:
+      - { type: field_greater_than, collection: jobs, field: value, value: 0 }
+      - { type: field_not_empty, collection: jobs, field: client }
+
+  - id: gate_invoiced
+    version: 2
+    last_reviewed: 2026-08-08
+    on_transition_to: invoiced
+    description: >
+      An invoice record must exist against this job, it must exist in Xero,
+      and the PDF must be filed. A status typed into a field proves nothing
+      on its own.
+    severity: block
+    bypassable: false
+    requires:
+      - type: related_record_exists
+        collection: invoices
+        match: { job: "$job.id" }
+        where: "invoice_number != ''"
+      # The validator has no Xero access yet, so this leg reports
+      # "not checked" (a skip, never a pass).
+      - type: xero_record_exists
+        entity: invoice
+        from_field: invoices.invoice_number
+        must_not_be_status: DELETED
+      - type: file_in_project_folder
+        patterns: ["*INV*.pdf", "*invoice*.pdf", "*Invoice*.pdf"]
+        modified_after: job.start_date
+
+  - id: gate_paid
+    version: 3
+    last_reviewed: 2026-09-10
+    on_flag_true: paid
+    description: Marked paid means the money reconciles, not that someone remembers it arriving.
+    severity: block
+    bypassable: false
+    requires:
+      - { type: field_greater_than, collection: jobs, field: paid_amount, value: 0 }
+      - type: reconciles
+        left: jobs.paid_amount
+        right: jobs.value
+        tolerance_percent: 2
+    on_fail:
+      message: "Job marked paid but paid_amount does not reconcile to job value."
+    notes: >
+      Runs on every job whose paid flag is true, whatever its status, the
+      same flag the dashboard's Paid filter reads. A paid tick with no
+      amount behind it is still wrong after the job moves to completed.
+
+  - id: gate_closed_reason
+    version: 2
+    last_reviewed: 2026-08-08
+    on_transition_to: [lost, cancelled]
+    description: A job that died should say why, so the reengage list means something.
+    severity: warn
+    bypassable: true
+    requires:
+      - { type: field_not_empty, collection: jobs, field: notes }
+
+  - id: gate_status_logged
+    version: 2
+    last_reviewed: 2026-08-08
+    on_transition_to: any
+    description: Every status change is written to the project markdown change log.
+    severity: warn
+    bypassable: true
+    # Documentation only; the validator does not read this key.
+    known_weakness: >
+      This finds the CLIENT folder, not the job's own folder, then passes
+      if any markdown file under that client mentions the status word. A
+      client with several jobs can therefore have one job's paperwork
+      satisfy all of them: for example a job with no folder of its own can
+      pass on a "QU7797 Refresh" project file belonging to another job for
+      the same client. Matching each job to its own folder would turn some
+      current passes into failures. That is a decision about how much
+      filing to require, so it is recorded here rather than changed.
+    requires:
+      - { type: project_md_changelog_entry, since: transition_time }
+
+# C. MONEY GATES
+# Where costs can go unrecovered, so none of these can be bypassed.
+money:
+
+  - id: shipping_not_forgotten
+    version: 2
+    last_reviewed: 2026-08-08
+    # Read for its field name only (see Engine._applies): the status list
+    # the code uses is core.job_status.CONFIRMED plus completed.
+    applies_when: "jobs.has_shipping == true and jobs.status in [won, invoicing, invoiced, commissioning, completed]"
+    description: >
+      If a job has shipping, the freight must be recharged, already paid,
+      or actively chased. It cannot simply sit there.
+    severity: block
+    bypassable: false
+    requires:
+      - type: any_of
+        options:
+          - { type: field_true, collection: jobs, field: shipping_paid }
+          - type: related_record_exists
+            collection: bills
+            match: { job: "$job.id" }
+            where: "type = 'shipping'"
+          - { type: open_todoist_task_matching, pattern: "(freight|shipping|duty|customs|recharge)" }
+          # Freight forwarder and courier names as they appear in filed
+          # documents. Adjust to the carriers actually used.
+          - type: file_in_project_folder
+            patterns: ["*Coastline*", "*QXP*", "*freight*", "*customs*", "*duty*"]
+    on_fail:
+      message: "Job has shipping but no freight recharge is filed, paid or chased."
+
+  - id: supplier_bill_recharged
+    version: 2
+    last_reviewed: 2026-08-08
+    applies_when: "jobs.supplier_paid == true and jobs.status != cancelled"
+    description: >
+      Money went out to a supplier. Either it has come back in from the
+      client, or an invoice exists, or a task is guarding the recharge.
+    severity: block
+    bypassable: false
+    requires:
+      - type: any_of
+        options:
+          - { type: field_greater_than, collection: jobs, field: paid_amount, value: 0 }
+          - type: related_record_exists
+            collection: invoices
+            match: { job: "$job.id" }
+          - { type: open_todoist_task_matching, pattern: "(recharge|invoice|bill)" }
+
+  - id: bill_not_orphaned
+    version: 1
+    last_reviewed: 2026-08-08
+    applies_when: "bill exists"
+    description: >
+      Every bill links to a job. A supplier bill with no job attached is
+      cost that will never be recharged because nothing connects it to
+      work that can be billed.
+    severity: block
+    bypassable: false
+    check: bill_job_links
+
+  - id: duty_recharged_with_margin
+    version: 2
+    last_reviewed: 2026-08-08
+    applies_when: "a shipping or parts bill is filed for a client rechargeable job"
+    description: >
+      Import duty and freight recharges follow the rules in the
+      splatt-shipment-invoice skill, including the handling margin and the
+      GST basis. Flag if a recharge invoice is missing the margin.
+    severity: block
+    bypassable: false
+    check: recharge_margin_applied
+    notes: >
+      The check confirms each shipping or parts bill is invoiced at no less
+      than its amount. The exact margin and GST rules are in
+      skills/splatt-shipment-invoice.
+
+# D. ACTIONS
+#
+# Messages sent to the ops Telegram channel during a validation run, by
+# validator/notifications.py. Every run announces its start and reports its
+# end, pass or fail, so a silent channel means the validator did not run.
+#
+# Only the `telegram` entries below are executed, together with their
+# `template` and `throttle`. Entries marked RESERVED are kept as a
+# specification but are not executed by any code; `notes` entries are
+# documentation. Template placeholders with no value are rendered as
+# "{name: not recorded}".
+actions:
+
+  on_start:
+    - telegram: ops
+      template: |
+        🔎 Validation started
+        Run: {run_id}
+        Trigger: {trigger}
+        Rules to check: {rule_count}
+        {timestamp}
+    - notes: >
+        Sent after the rules file has loaded and before the first rule is
+        evaluated, so a run that dies part way still leaves a trace.
+
+  on_pass:
+    - telegram: ops
+      template: |
+        ✅ Validation passed
+        Run: {run_id}
+        Checked {rules_passed}/{rule_count} rules, 0 blocking
+        {warn_count} warnings
+        What was validated: {rule_ids_checked}
+        What was done: {actions_taken}
+        Took {duration_seconds}s
+    - notes: >
+        Sent on every run where nothing blocked, including a run with
+        nothing to report. Do not add an "only if something changed"
+        condition; this message is how the channel shows the validator ran.
+
+  on_complete:
+    - telegram: ops
+      # Descriptive. cli.py sends on_complete only when a run ends without
+      # a verdict; the `when` key itself is not read.
+      when: run_ended_without_pass_or_block
+      template: |
+        ⚠️ Validation ended without a verdict
+        Run: {run_id}
+        Last rule reached: {last_rule_id}
+        Reason: {exit_reason}
+    - notes: >
+        Covers a crash or an unreachable database, so a run that died is
+        distinguishable from one that never started.
+
+  on_block:
+    - telegram: ops
+      template: |
+        🛑 Validation BLOCKED
+        Run: {run_id}
+        Rule: {rule_id} v{rule_version}
+        {fail_message}
+        Record: {collection}/{record_id}
+        Bypassable: {bypassable}
+        Blocking count: {blocking_count}
+      throttle:
+        # One message per failing rule and at most three per run, so a run
+        # with many failures does not flood the channel. on_block_summary
+        # below reports the full count, including those held back.
+        group_by: rule_id
+        max_per_run: 1
+        max_total_per_run: 3
+        # Descriptive: the held-back count is always reported.
+        summarise_remainder: true
+    # RESERVED, not implemented: no code opens this Todoist task.
+    - todoist_task:
+        section: overdue
+        title_prefix: "VALIDATION"
+        priority: 4
+    # Descriptive: enforced by exit code 1 and may_report_success=false.
+    - agent_may_report_success: false
+
+  on_block_summary:
+    - telegram: ops
+      template: |
+        🛑 Validation finished BLOCKED
+        Run: {run_id}
+        {blocking_count} blocking across {rules_blocked} rules: {rule_ids_blocked}
+        Checked {rules_passed}/{rule_count} rules, {warn_count} warnings
+        Blocks rolled up: {held_back_blocks}
+        Warnings rolled up: {held_back_warnings}
+        What was done: {actions_taken}
+        Took {duration_seconds}s
+    - notes: >
+        The counterpart to on_pass. A blocked run ends with exactly one of
+        these, never throttled, so the last message always carries the
+        whole verdict.
+
+  on_warn:
+    - telegram: ops
+      template: |
+        🟡 Validation warning
+        Run: {run_id}
+        Rule: {rule_id}
+        {fail_message}
+        Record: {collection}/{record_id}
+      throttle:
+        # A warn rule can fail on hundreds of records, so warnings roll up
+        # into one message per rule per run.
+        group_by: rule_id
+        max_per_run: 1
+        # Descriptive: the held-back count is always reported.
+        summarise_remainder: true
+    # RESERVED, not implemented: no code opens this Todoist task.
+    - todoist_task:
+        section: today
+        title_prefix: "VALIDATION"
+        priority: 3
+    # Descriptive: warnings are listed under "warnings" in the JSON report.
+    - agent_must_surface_in_summary: true
+
+  # RESERVED, not implemented: no code fires on_bypass. Bypasses are
+  # recorded in state/bypasses.json and listed under "Bypassed" in the
+  # report, but none of the entries below is executed.
+  on_bypass:
+    - write_to_validation_report: true
+    - log_interaction:
+        type: note
+        subject: "Validation bypass approved by the operator"
+    - telegram: ops
+      template: |
+        🔓 Validation bypassed by the operator
+        Run: {run_id}
+        Rule: {rule_id}
+        Reason: {bypass_reason}
+
+# E. NOTIFICATION ROUTING
+#
+# Everything validation related goes to the ops channel, so the general
+# channel carries client and job traffic and the ops channel shows whether
+# the validator is running.
+notifications:
+
+  # Read by validator/cli.py to pick the Telegram channel.
+  channel: ops
+  # Descriptive, not read by code.
+  msg_type: validation
+
+  # Descriptive, not read by code: these hooks are never throttled.
+  always_send:
+    - on_start
+    - on_pass
+    - on_block_summary
+    - on_complete
+  # on_block and on_warn are throttled, see above. Their counts are never
+  # lost: they are carried by on_block_summary and by the held-back line.
+
+  silence_is_a_fault:
+    enabled: true
+    max_quiet_hours: 24
+    description: >
+      If the ops channel has seen no accepted validation message for longer
+      than max_quiet_hours, that is itself a fault. `python -m validator
+      heartbeat` exits 1, and the daemon loop sends an alert to the ops
+      channel. A quiet channel means the validator has stopped, not that
+      everything is fine.
+    # RESERVED, not implemented: the heartbeat command prints these entries
+    # but nothing executes them.
+    on_trip:
+      - todoist_task:
+          section: overdue
+          title_prefix: "VALIDATION"
+          title: "Validator has gone quiet, no ops message in 24h"
+          priority: 4
+
+  # Descriptive, not read by code. Every validation message should answer
+  # these three questions, not only report a status.
+  message_must_answer:
+    - what_was_checked   # the rule ids, not a count on its own
+    - what_was_found     # pass, warn or block, with the record
+    - what_was_done      # records written, tasks opened, or nothing

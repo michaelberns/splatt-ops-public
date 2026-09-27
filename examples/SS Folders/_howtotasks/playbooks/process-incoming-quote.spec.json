@@ -1,0 +1,48 @@
+{
+  "playbook_id": "process-incoming-quote",
+  "version": 1,
+  "trigger": "incoming_quote_email",
+  "description": "A supplier has sent a formal quote as a PDF. File the PDF in both the supplier folder and the project folder, create the quote record, and update the supplier relationship file and the project file.",
+  "inputs_required": ["gmail_message_id", "supplier_name", "client_id", "project_path"],
+  "steps": [
+    {
+      "id": "1_download_pdf",
+      "description": "Download the PDF attachment. Capture pdf_filename and pdf_size_bytes.",
+      "validates": [
+        { "type": "extracted_fields", "fields": ["pdf_filename", "pdf_size_bytes"] }
+      ]
+    },
+    {
+      "id": "2_file_pdf_both_folders",
+      "description": "Save the PDF into the supplier's attachments folder and the project folder.",
+      "validates": [
+        { "type": "file_modified", "path": "_Suppliers/$inputs.supplier_name/attachments/$evidence.pdf_filename", "since": "$run.started_at" },
+        { "type": "file_modified", "path": "$inputs.project_path/$evidence.pdf_filename", "since": "$run.started_at" }
+      ]
+    },
+    {
+      "id": "3_create_pocketbase_quote",
+      "description": "Create the quote record in PocketBase with the create_quote MCP tool.",
+      "validates": [
+        { "type": "pocketbase_record", "collection": "quotes", "match": { "client": "$inputs.client_id" }, "since": "$run.started_at", "capture_id_as": "quote_id" }
+      ]
+    },
+    {
+      "id": "4_update_supplier_relationship",
+      "description": "Add the quote to the supplier's RELATIONSHIP.md (Active Quotes, Documents on File and Change Log), stating list price, discount, net price and tax basis.",
+      "validates": [
+        { "type": "file_modified", "path": "_Suppliers/$inputs.supplier_name/RELATIONSHIP.md", "since": "$run.started_at" }
+      ]
+    },
+    {
+      "id": "5_update_project_md",
+      "description": "Run the update-project-md playbook for this project with update_type='new_quote'.",
+      "validates": [
+        { "type": "file_modified", "path": "$inputs.project_path/PROJECT.md", "since": "$run.started_at" }
+      ]
+    }
+  ],
+  "final_validation": [
+    { "type": "extracted_fields", "fields": ["quote_id", "pdf_filename"] }
+  ]
+}

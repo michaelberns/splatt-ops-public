@@ -1,0 +1,41 @@
+{
+  "playbook_id": "log-interaction",
+  "version": 1,
+  "trigger": "triage_handoff_informational",
+  "description": "An inbound email is informational only: no reply, no new task and no task to complete (for example a newsletter or a delivery confirmation). Record one PocketBase interaction so the client's history shows the email was received and read. Rule: this playbook never sends, never creates tasks and never replies.",
+  "inputs_required": ["gmail_message_id", "gmail_thread_id", "sender_email", "sender_company", "client_id_or_null"],
+  "steps": [
+    {
+      "id": "1_read_full_body",
+      "description": "Fetch the message and read the full body, not the preview snippet. Capture body_excerpt_first_300, subject_line and one_line_summary (one plain sentence saying what the email contained).",
+      "validates": [
+        { "type": "extracted_fields", "fields": ["body_excerpt_first_300", "subject_line", "one_line_summary"] }
+      ]
+    },
+    {
+      "id": "2_decide_log_or_skip",
+      "description": "If client_id_or_null is 'null' there is no client to attach the interaction to: capture should_log=false and skip step 3. Otherwise capture should_log=true.",
+      "validates": [
+        { "type": "extracted_fields", "fields": ["should_log"] }
+      ]
+    },
+    {
+      "id": "3_create_pocketbase_interaction",
+      "description": "Create an interaction with type='email', summary='Informational: <one_line_summary>' and client=client_id_or_null, using the pocketbase MCP tool log_interaction. Skip when should_log=false.",
+      "skippable": true,
+      "validates": [
+        { "type": "pocketbase_record", "collection": "interactions", "match": { "client": "$inputs.client_id_or_null" }, "since": "$run.started_at" }
+      ]
+    },
+    {
+      "id": "4_emit_summary",
+      "description": "Capture outcome: either 'logged' or 'skipped_no_client'.",
+      "validates": [
+        { "type": "extracted_fields", "fields": ["outcome"] }
+      ]
+    }
+  ],
+  "final_validation": [
+    { "type": "extracted_fields", "fields": ["one_line_summary", "outcome"] }
+  ]
+}

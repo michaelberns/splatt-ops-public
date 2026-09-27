@@ -1,0 +1,164 @@
+# Playbook: file-supplier-document
+#
+# Run whenever a supplier document (PDF brochure, datasheet or quote) is
+# filed under _Suppliers/<Vendor>/ in SS Folders. The same run must update
+# the vendor's RELATIONSHIP.md with the price arithmetic, a Documents on
+# File row and a Change Log row. If the document is for a project, the
+# run hands off to update-project-md.
+#
+# Paths are relative to the SS Folders root. The spec is registered with
+# the playbook server next to update-project-md and
+# update-project-overview-html; until it is, the agent follows these steps
+# as a checklist.
+
+id: file-supplier-document
+version: 1
+last_updated: 2026-05-10
+chained_with:
+  - update-project-md           # required when project_path is given
+
+description: |
+  Keeps every supplier folder self-describing. A document saved into
+  _Suppliers/<Vendor>/ must be recorded, in the same run, in that
+  vendor's RELATIONSHIP.md.
+
+inputs:
+  required:
+    - supplier_folder_path        # e.g. _Suppliers/Aquaform
+    - canonical_pdf_path          # e.g. _Suppliers/Aquaform/Aquaform-Cobalt-3S-Brochure-2023.pdf
+    - document_type               # brochure | datasheet | formal_quote | indicative_quote | reference
+    - source_email_from           # e.g. christo@aquaform.example.co.za
+    - source_email_date           # YYYY-MM-DD
+  optional:
+    - project_path                # the project folder, if the document is for a project
+    - project_attachment_path     # the project's copy of the document
+    - vendor_name                 # taken from the folder name if not given
+    - list_price                  # e.g. "US$4,000"
+    - list_price_tax_basis        # "ex-tax" | "incl-vat" | "incl-gst"
+    - discount_pct                # a number, e.g. 25
+    - net_price                   # e.g. "US$3,000 ex-tax"
+    - tax_treatment_note          # one line
+    - quote_status                # indicative | formal | superseded
+    - model_name                  # e.g. "Cobalt 3S"
+    - client_context              # e.g. "Alex Carter, Triblock and Pretreatment Line"
+
+steps:
+
+  - id: 1_verify_supplier_folder
+    description: |
+      Confirm the supplier folder exists at supplier_folder_path. If it
+      does not, create it and record supplier_folder_existed=false.
+      vendor_name comes from the folder name when it was not passed in.
+    validates:
+      - type: extracted_fields
+        fields: [supplier_folder_path, supplier_folder_existed, vendor_name]
+
+  - id: 2_verify_canonical_pdf
+    description: |
+      Confirm the PDF is filed at canonical_pdf_path. Record pdf_byte_size
+      and pdf_mtime. The filename should follow the convention:
+        - Brochures: <Vendor>-<Model>-Brochure-<YYYY>.pdf (publication year)
+        - Quotes:    <Vendor>-<Client>-Quote-<YYYY-MM-DD>.pdf
+      A filename that does not follow it is a warning, not a failure.
+    validates:
+      - type: file_exists
+        path: $inputs.canonical_pdf_path
+      - type: extracted_fields
+        fields: [pdf_byte_size, pdf_mtime, filename_matches_convention]
+
+  - id: 3_verify_project_mirror
+    description: |
+      If project_path was given, confirm the project copy exists at
+      project_attachment_path with today's date in its filename. With no
+      project_path there is nothing to check. Record
+      project_mirror_required (true or false) and
+      project_mirror_path_or_null.
+    validates:
+      - type: extracted_fields
+        fields: [project_mirror_required, project_mirror_path_or_null]
+
+  - id: 4_verify_or_create_relationship_md
+    description: |
+      Confirm <supplier_folder_path>/RELATIONSHIP.md exists. If it does not,
+      create it from templates/RELATIONSHIP.template.md in the
+      splatt-supplier-filing skill. Record relationship_md_path,
+      relationship_md_existed_before_run and pre_edit_byte_size.
+      A newly created RELATIONSHIP.md also means _Suppliers/README.md must
+      move the vendor from its "no folder yet" list into the active
+      suppliers table; record that the update is queued.
+    validates:
+      - type: file_exists
+        path: $inputs.supplier_folder_path/RELATIONSHIP.md
+      - type: extracted_fields
+        fields:
+          - relationship_md_path
+          - relationship_md_existed_before_run
+          - pre_edit_byte_size
+          - suppliers_readme_update_queued
+
+  - id: 5_apply_relationship_md_edits
+    description: |
+      Edit RELATIONSHIP.md in one operation:
+        a) Add or update the Active Quotes / Indicative Pricing entry with
+           the full pricing table (list price, tax basis, discount, net
+           price, tax treatment, status, source, brochure on file). Write
+           the arithmetic out: "US$X less Y% = US$Z".
+        b) Add a Documents on File row for the new PDF.
+        c) Add a Change Log row dated today.
+        d) Set the Last updated line to today.
+      Record post_edit_byte_size, lines_added and sections_edited.
+    validates:
+      - type: file_modified
+        path: $inputs.supplier_folder_path/RELATIONSHIP.md
+        since: $run.started_at
+      - type: extracted_fields
+        fields: [post_edit_byte_size, lines_added, sections_edited]
+
+  - id: 6_verify_pricing_block_completeness
+    description: |
+      Read RELATIONSHIP.md back and check the Active Quotes entry for this
+      document has all of:
+        - the model name
+        - the list price with its tax basis ("ex-tax", "incl-vat" or "incl-gst")
+        - the discount percentage
+        - the net price, with the tax basis stated again
+        - the tax treatment note
+        - the status (indicative, formal or superseded)
+        - the date received
+        - the sender of the source email
+        - the exact filename of the PDF on file
+      Record pricing_block_complete, which must be true.
+    validates:
+      - type: extracted_fields
+        fields: [pricing_block_complete]
+
+  - id: 7_emit_handoff
+    description: |
+      If project_path was given, set handoff_playbook_id to
+      "update-project-md" and handoff_inputs to an object with
+      project_path, update_type ("new_quote" when document_type is
+      formal_quote, otherwise "document_added"), an update_summary naming
+      the supplier and the document, and the section changes for the
+      Communications Log, Documents, Supplier Outreach Tracker, Key
+      Decisions & Notes and Change Log.
+      With no project_path, set handoff_playbook_id to null.
+    validates:
+      - type: extracted_fields
+        fields: [handoff_playbook_id, handoff_inputs]
+
+failure_modes:
+  - relationship_md_not_updated:
+      severity: HARD_FAIL
+      reason: Without the RELATIONSHIP.md update the price exists only in the email.
+  - pricing_math_not_shown:
+      severity: HARD_FAIL
+      reason: RELATIONSHIP.md must show "US$X less Y% = US$Z", not only the net price.
+  - tax_basis_ambiguous:
+      severity: HARD_FAIL
+      reason: The tax basis must be stated as ex-tax or incl-tax. An unclear basis leads to margin errors later.
+  - source_email_not_recorded:
+      severity: SOFT_FAIL
+      reason: The sender and date are needed when the price is looked at again later.
+  - suppliers_readme_not_updated_for_new_supplier:
+      severity: SOFT_FAIL
+      reason: The supplier index falls out of date. Report it to the operator and let the run complete.

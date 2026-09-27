@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+#
+# bin/install-autostart: make the stack start at login and restart itself
+# (macOS only).
+#
+#   bin/install-autostart              install the launchd agent and start it
+#   bin/install-autostart --uninstall  remove it
+#   bin/install-autostart --status     is it loaded, is it running
+#
+# Run it once, in a terminal on this machine.
+#
+# What it installs
+#   A per-user launchd agent, ~/Library/LaunchAgents/com.splatt.stack.plist,
+#   that runs bin/autostart. bin/autostart runs bin/start with
+#   --only-if-down and --no-dashboard. launchd starts the agent at login and
+#   starts it again whenever it exits (at most every 30 seconds), and
+#   bin/start itself restarts PocketBase, the files server and the sync
+#   daemon when one of them dies. Output goes to logs/autostart.log.
+#
+#   No sudo is needed: this is a per-user agent, not a system daemon, and it
+#   runs only while the user is logged in.
+#
+# The one manual step
+#   macOS protects ~/Documents (TCC). A terminal the user has granted access
+#   can read it, a launchd agent cannot, so when the repo lives under
+#   ~/Documents the agent fails with "Operation not permitted" until /bin/bash
+#   is added to Full Disk Access in System Settings. The check at the end of
+#   this script spots that and prints the steps. It cannot be scripted,
+#   because that is the point of the protection.
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LABEL="com.splatt.stack"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+DOMAIN="gui/$(id -u)"
+
+say() { printf '  %s\n' "$*"; }
+
+case "${1:-}" in
+--status)
+    if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
+        say "loaded:  yes"
+        launchctl print "$DOMAIN/$LABEL" | grep -E '^\s+(state|pid|last exit code)' || true
+    else
+        say "loaded:  no. Run bin/install-autostart"
+    fi
+    for port in 8090 8092; do
+        if nc -z 127.0.0.1 "$port" 2>/dev/null; then
+            say "port $port: open"
+        else
+            say "port $port: CLOSED"
+        fi
+    done
+    # Only the tail of the log: failures from before the permission was
+    # granted stay in the file, and would otherwise be reported again.
+    if tail -20 "$REPO/logs/autostart.log" 2>/dev/null | grep -q "Operation not permitted"; then
+        say ""
+        say "TCC:     BLOCKED. The agent cannot read ~/Documents."
+        say "         open \"x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles\""
+        say "         add /bin/bash, toggle ON, then:"
+        say "           launchctl kickstart -k $DOMAIN/$LABEL"
+        say "         Ports may still show open because a Terminal bin/start"
+        say "         is running. That is not the agent."
+    fi
+    exit 0
+    ;;
+--uninstall)
+    launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+    rm -f "$PLIST"
+    say "Removed. The stack will not start itself any more."
+    say "Start it by hand with: bin/start"
+    exit 0
+    ;;
+"") ;;
+*)
+    echo "Unknown option: $1"
+    echo "Try: --status, --uninstall, or no argument to install"
+    exit 2
+    ;;
+esac
+
+mkdir -p "$HOME/Library/LaunchAgents" "$REPO/logs"
+
+# PATH is set explicitly. A launchd agent does not inherit the PATH from the
+# shell profile, so without this node, python3 and a Homebrew pocketbase
+# would not be found.
+cat > "$PLIST" <<PLISTEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$LABEL</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>$REPO/bin/autostart</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>$REPO</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>$REPO/logs/autostart.log</string>
+    <key>StandardErrorPath</key>
+    <string>$REPO/logs/autostart.log</string>
+</dict>
+</plist>
+PLISTEOF
+
+say "Wrote $PLIST"
+
+# bootout first so a reinstall replaces the old definition rather than
+# failing with "service already loaded" and leaving the previous one running.
+launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+launchctl bootstrap "$DOMAIN" "$PLIST"
+launchctl enable "$DOMAIN/$LABEL"
+
+say "Loaded and started."
+say ""
+
+# Check the log for the TCC refusal before reporting success. An agent that
+# cannot read ~/Documents fails at once and silently, and a stack started by
+# hand in a terminal would still make the ports look healthy.
+sleep 6
+if tail -20 "$REPO/logs/autostart.log" 2>/dev/null | grep -q "Operation not permitted"; then
+    say "=============================================================="
+    say "  NOT WORKING YET. One thing left, and it needs your mouse."
+    say "=============================================================="
+    say ""
+    say "  macOS blocked the agent from reading ~/Documents. The log says"
+    say "  'Operation not permitted'. That is TCC, not a broken script."
+    say "  Your Terminal has permission for that folder. launchd does not."
+    say ""
+    say "  Confirm it with:  launchctl print $DOMAIN/$LABEL | grep 'last exit'"
+    say "  Exit code 126 with an executable file is TCC, every time."
+    say ""
+    say "  Fix it once. Do not go hunting through System Settings, the"
+    say "  pane has moved between releases. This opens the right one:"
+    say ""
+    say "    open \"x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles\""
+    say ""
+    say "    then +, Cmd+Shift+G, type /bin/bash, add it, toggle ON"
+    say ""
+    say "  Then come back and run:"
+    say ""
+    say "    launchctl kickstart -k $DOMAIN/$LABEL"
+    say "    bin/install-autostart --status"
+    say ""
+    say "  Granting /bin/bash is broad: it covers every bash script launchd"
+    say "  runs as you. The narrow alternative is moving this repo AND"
+    say "  Splatt/SS Folders out of ~/Documents, because the playbook server"
+    say "  and both guards read SS Folders. If neither appeals, uninstall:"
+    say ""
+    say "    bin/install-autostart --uninstall"
+    say ""
+    say "  Stop any bin/start you have running in a Terminal window first,"
+    say "  or the two will fight over port 8090."
+    exit 1
+fi
+
+say "The stack now starts at login and restarts itself if it dies."
+say "Log:      $REPO/logs/autostart.log"
+say "Check:    bin/install-autostart --status"
+say "Remove:   bin/install-autostart --uninstall"

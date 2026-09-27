@@ -1,0 +1,631 @@
+#!/usr/bin/env bash
+#
+# bin/start: bring up the whole splatt-ops stack on this machine and keep it
+# running until you stop it.
+#
+# Usage
+#   bin/start                  start everything and stay in the foreground
+#   bin/start --check          report what was found and what would run, start nothing
+#   bin/start --no-sync        start everything except the Todoist sync daemon
+#   bin/start --no-guards      do not start the two folder guards
+#   bin/start --no-dashboard   do not open the dashboard in a browser
+#   bin/start --only-if-down   exit quietly if the stack is already answering
+#   bin/start --help           print this text
+#
+# Flags can be combined. Ctrl+C, or closing the terminal window, stops every
+# process the script started.
+#
+# What comes up, in this order
+#   1. PocketBase, the database, on 127.0.0.1:8090 (admin UI at /_/). It is
+#      bound to the loopback address, so only programs on this machine can
+#      reach it. Its data lives in pb_data/ inside the repo.
+#   2. The project files server, server/project-files-server.js, on port
+#      8092. It gives the dashboard the SS Folders tree, the playbook API and
+#      the Xero panel. Its log is logs/project-files-server.log.
+#   3. The SS Folders guard, guards/ss-folders-guard.py. It moves stray
+#      PROJECT.md files found in ~/Desktop, ~/Downloads and ~/Documents back
+#      into SS Folders. Skipped with --no-guards.
+#   4. The deliverables guard, guards/ss-deliverables-guard.py. It does the
+#      same for stray client documents. Skipped with --no-guards.
+#   5. The sync daemon, `python -m daemon loop --write`, which mirrors the
+#      Todoist board into PocketBase and back. It writes its own rotating log
+#      at logs/daemon.log. Skipped with --no-sync.
+#   6. The dashboard, dashboard/index.html, opened in Chrome (or the default
+#      browser when Chrome is not installed). Skipped with --no-dashboard.
+#
+# What each flag is for
+#   --check         Runs every discovery step below, lists every missing
+#                   piece at once and points at docs/INSTALL.md. Starts,
+#                   stops and writes nothing, so it is safe on a fresh clone.
+#                   --dry-run is accepted as another name for it.
+#   --no-sync       For working on something else without Todoist changing
+#                   underneath you. The report says loudly that nothing is
+#                   polling Todoist.
+#   --no-guards     For running against a folder other than the real SS
+#                   Folders, such as the demo folder in examples/. The guards
+#                   scan the whole of ~/Desktop, ~/Downloads and ~/Documents,
+#                   so left on they would move real files into the demo.
+#   --no-dashboard  For launchd (see bin/autostart): a restart that opened a
+#                   browser tab each time would fill the screen with tabs.
+#   --only-if-down  Also for launchd. If PocketBase and the files server both
+#                   answer, something else already runs the stack, so this
+#                   run exits instead of taking the ports from it.
+#
+# Before anything starts, the script checks that
+#   - the Python interpreter (the repo's .venv when it exists) can import
+#     httpx and yaml,
+#   - .env exists (it is read here, and by every process started below),
+#   - a PocketBase binary exists (./pocketbase in the repo, or one on PATH)
+#     and so does the database folder, pb_data/ in the repo,
+#   - node and server/project-files-server.js exist,
+#   - the SS Folders directory exists.
+# A missing piece stops the launch before any process is started.
+#
+# Environment
+#   SS_FOLDERS_PATH  Where the project folders live. Default:
+#                    ~/Documents/Splatt/SS Folders. It may be set in .env, but
+#                    a value given on the command line wins. The chosen folder
+#                    is passed to the files server and both guards.
+#
+#   Example, the demo folder shipped with the repo:
+#     SS_FOLDERS_PATH="$PWD/examples/SS Folders" bin/start --no-guards
+#
+# Supervision
+#   While running, the script restarts PocketBase, the files server or the
+#   sync daemon if one of them exits, up to 5 times in 10 minutes each. A
+#   process that keeps dying inside that window is treated as a fault: the
+#   script stops restarting it and shuts the whole stack down.
+
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO"
+
+CHECK_ONLY=0
+START_SYNC=1
+START_GUARDS=1
+OPEN_DASHBOARD=1
+ONLY_IF_DOWN=0
+for arg in "$@"; do
+    case "$arg" in
+        --check|--dry-run) CHECK_ONLY=1 ;;
+        --no-sync)         START_SYNC=0 ;;
+        --no-guards)       START_GUARDS=0 ;;
+        --no-dashboard)    OPEN_DASHBOARD=0 ;;
+        --only-if-down)    ONLY_IF_DOWN=1 ;;
+        -h|--help)
+            # Print the comment block at the top of this file.
+            awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $arg"
+            echo "Try: bin/start --help"
+            exit 2
+            ;;
+    esac
+done
+
+PB_ADDR="127.0.0.1:8090"
+PB_URL="http://$PB_ADDR"
+FILES_URL="http://127.0.0.1:8092"
+INSTALL_DOC="docs/INSTALL.md"
+
+say()  { printf '  %s\n' "$*"; }
+warn() { printf '  WARNING  %s\n' "$*"; }
+fail() { printf '  ERROR    %s\n' "$*"; }
+
+# A blocker is anything that would stop the stack from working. The first
+# argument is the problem, any further arguments are detail lines.
+#
+# In a normal run the first blocker stops the script before anything starts.
+# In check mode it is counted and the script carries on, so one run lists
+# every problem instead of making you fix them one at a time.
+BLOCKERS=0
+blocker() {
+    fail "$1"
+    shift
+    local line
+    for line in "$@"; do
+        fail "         $line"
+    done
+    BLOCKERS=$((BLOCKERS + 1))
+    if [ "$CHECK_ONLY" -eq 0 ]; then
+        echo ""
+        say "Nothing was started. Fix the above and run bin/start again."
+        say "Setup steps are in $INSTALL_DOC, and bin/start --check lists every problem at once."
+        exit 1
+    fi
+}
+
+echo ""
+say "check: repo         $REPO"
+
+# ==================================================================
+# Python
+# ==================================================================
+# Every Python process below is started through "$PY". The repo's .venv is
+# preferred because requirements.txt is what fills it, so it is the one
+# interpreter whose packages this repo controls. A bare python3 is whatever
+# is first on PATH, with whatever happens to be installed in it.
+#
+# The import check matters because the sync daemon runs in the background
+# with its console sent to /dev/null. An interpreter without httpx would give
+# a daemon that dies in its first second while the rest of the stack looks
+# healthy, so a missing import stops the launch instead.
+if [ -x "$REPO/.venv/bin/python" ]; then
+    PY="$REPO/.venv/bin/python"
+    say "check: python       $PY"
+elif command -v python3 >/dev/null 2>&1; then
+    PY="python3"
+    say "check: python       $(command -v python3), no .venv in the repo"
+    warn "Make one so the interpreter matches requirements.txt:"
+    warn "    python3 -m venv .venv && .venv/bin/pip install -r requirements.txt"
+else
+    PY="python3"
+    say "check: python       not found"
+    blocker "No python3 on PATH, so nothing here can run." \
+        "Install Python 3, then follow $INSTALL_DOC."
+fi
+
+MISSING=""
+for module in httpx yaml; do
+    if ! "$PY" -c "import $module" >/dev/null 2>&1; then
+        MISSING="$MISSING $module"
+    fi
+done
+if [ -n "$MISSING" ]; then
+    blocker "$PY cannot import:$MISSING" \
+        "The sync daemon needs these. It runs in the background with its" \
+        "console discarded, so without them it would exit at once while" \
+        "the rest of the stack looked healthy." \
+        "Fix with:  .venv/bin/pip install -r requirements.txt"
+fi
+
+# ==================================================================
+# Credentials and settings
+# ==================================================================
+# .env holds the Todoist token, the PocketBase superuser login and the
+# Telegram tokens. It is exported so every process started below inherits
+# it. Check mode reads it too, so the report reflects any setting in it
+# (SS_FOLDERS_PATH, for example) exactly as a real start would.
+#
+# A SS_FOLDERS_PATH given on the command line wins over one in .env, so a
+# demo run can point at examples/SS Folders without editing .env.
+CALLER_SS_FOLDERS_PATH="${SS_FOLDERS_PATH:-}"
+if [ -f "$REPO/.env" ]; then
+    say "check: env          $REPO/.env"
+    set -a
+    # shellcheck disable=SC1091
+    source "$REPO/.env"
+    set +a
+else
+    say "check: env          not found: $REPO/.env"
+    blocker "No .env in the repo. Copy .env.example to .env and fill it in." \
+        "$INSTALL_DOC lists what each key is for."
+fi
+if [ -n "$CALLER_SS_FOLDERS_PATH" ]; then
+    SS_FOLDERS_PATH="$CALLER_SS_FOLDERS_PATH"
+fi
+
+# ==================================================================
+# PocketBase
+# ==================================================================
+# The binary is the repo's own ./pocketbase when present, otherwise one on
+# PATH. The data is always the repo's pb_data/, which is created during
+# install (see docs/INSTALL.md). Requiring the folder up front means a wrong
+# path can never start an empty database that the sync daemon would then
+# fill with a second copy of everything.
+PB_BIN=""
+PB_DATA="$REPO/pb_data"
+if [ -f "$REPO/pocketbase" ]; then
+    PB_BIN="$REPO/pocketbase"
+elif command -v pocketbase >/dev/null 2>&1; then
+    PB_BIN="$(command -v pocketbase)"
+fi
+
+if [ -n "$PB_BIN" ] && [ -x "$PB_BIN" ] && [ -d "$PB_DATA" ]; then
+    say "check: pocketbase   $PB_BIN"
+    say "check: pb data      $PB_DATA"
+else
+    say "check: pocketbase   ${PB_BIN:-not found}"
+    if [ -d "$PB_DATA" ]; then
+        say "check: pb data      $PB_DATA"
+    else
+        say "check: pb data      not found: $PB_DATA"
+    fi
+    PB_HINT="$INSTALL_DOC shows how to download PocketBase and create the database."
+    if [ -n "$PB_BIN" ] && [ ! -x "$PB_BIN" ]; then
+        PB_HINT="$PB_BIN is not executable. Fix with: chmod +x \"$PB_BIN\""
+    fi
+    blocker "No usable PocketBase install. It needs both of these:" \
+        "a pocketbase binary at $REPO/pocketbase or on PATH" \
+        "a database folder at $PB_DATA" \
+        "$PB_HINT"
+fi
+
+# ==================================================================
+# Project files server, and the folder it serves
+# ==================================================================
+PF_SERVER="$REPO/server/project-files-server.js"
+if [ -f "$PF_SERVER" ]; then
+    say "check: files server $PF_SERVER"
+else
+    say "check: files server not found: $PF_SERVER"
+    blocker "server/project-files-server.js is missing from the repo."
+fi
+
+if command -v node >/dev/null 2>&1; then
+    say "check: node         $(command -v node)"
+else
+    say "check: node         not found"
+    blocker "node is not on PATH, so the files server cannot start." \
+        "Install Node.js, then follow $INSTALL_DOC."
+fi
+
+# SS Folders holds one folder per client project. A missing folder is a
+# warning rather than a blocker: the database and the sync still work, the
+# files pages of the dashboard are simply empty.
+SS_FOLDERS="${SS_FOLDERS_PATH:-$HOME/Documents/Splatt/SS Folders}"
+if [ -d "$SS_FOLDERS" ]; then
+    say "check: ss folders   $SS_FOLDERS"
+else
+    say "check: ss folders   not found: $SS_FOLDERS"
+    warn "SS Folders was not found, so the files server will have nothing to serve."
+    warn "Create the folder, or set SS_FOLDERS_PATH to where it is."
+fi
+export SS_FOLDERS_PATH="$SS_FOLDERS"
+
+# ==================================================================
+# Guards
+# ==================================================================
+GUARD_SCRIPT="$REPO/guards/ss-folders-guard.py"
+DELIV_GUARD_SCRIPT="$REPO/guards/ss-deliverables-guard.py"
+if [ "$START_GUARDS" -eq 0 ]; then
+    say "check: guards       skipped, you passed --no-guards"
+else
+    [ -f "$GUARD_SCRIPT" ] \
+        && say "check: guard        $GUARD_SCRIPT" \
+        || warn "guards/ss-folders-guard.py is missing, stray project files will stay put."
+    [ -f "$DELIV_GUARD_SCRIPT" ] \
+        && say "check: guard        $DELIV_GUARD_SCRIPT" \
+        || warn "guards/ss-deliverables-guard.py is missing, stray documents will stay put."
+fi
+
+# ==================================================================
+# Sync daemon
+# ==================================================================
+if [ "$START_SYNC" -eq 0 ]; then
+    say "check: sync         skipped, you passed --no-sync"
+    warn "Nothing will poll Todoist while this stack is up."
+else
+    say "check: sync         $PY -m daemon loop --write"
+fi
+
+# ==================================================================
+# Dashboard
+# ==================================================================
+DASHBOARD="$REPO/dashboard/index.html"
+if [ -f "$DASHBOARD" ]; then
+    if [ "$OPEN_DASHBOARD" -eq 1 ]; then
+        say "check: dashboard    $DASHBOARD"
+    else
+        say "check: dashboard    $DASHBOARD, not opened (--no-dashboard)"
+    fi
+else
+    warn "dashboard/index.html is missing, nothing will open in the browser."
+fi
+
+if [ "$CHECK_ONLY" -eq 1 ]; then
+    echo ""
+    if [ "$BLOCKERS" -eq 0 ]; then
+        say "Nothing is missing. bin/start would bring the stack up."
+        exit 0
+    fi
+    if [ "$BLOCKERS" -eq 1 ]; then
+        say "One thing would stop the stack from starting. Nothing was started."
+    else
+        say "$BLOCKERS things would stop the stack from starting. Nothing was started."
+    fi
+    say "See $INSTALL_DOC for how to set up each missing piece."
+    exit 1
+fi
+
+# ==================================================================
+# Already running?
+# ==================================================================
+# A normal start takes ports 8090 and 8092 from whatever holds them, which is
+# right when a person replaces a stuck stack. launchd, however, runs this
+# every 30 seconds, and taking the ports each time would kill a stack
+# started by hand in a terminal. With --only-if-down the script only starts
+# the stack when nothing is answering, and leaves a running one alone.
+if [ "$ONLY_IF_DOWN" -eq 1 ]; then
+    UP=0
+    if command -v curl >/dev/null 2>&1; then
+        curl -sS -m 3 -o /dev/null "$PB_URL/api/health" 2>/dev/null && \
+        curl -sS -m 3 -o /dev/null "$FILES_URL/api/health" 2>/dev/null && UP=1
+    fi
+    if [ "$UP" -eq 1 ]; then
+        say "The stack is already up on 8090 and 8092. Leaving it alone."
+        exit 0
+    fi
+    say "Nothing answering on 8090/8092. Starting the stack."
+fi
+
+mkdir -p "$REPO/logs" "$REPO/state"
+
+# ==================================================================
+# Stop anything left over, so the ports are free
+# ==================================================================
+echo ""
+say "Stopping anything left over from last time..."
+pkill -f "pocketbase serve"          2>/dev/null || true
+pkill -f "project-files-server\.js"  2>/dev/null || true
+pkill -f "ss-folders-guard\.py"      2>/dev/null || true
+pkill -f "ss-deliverables-guard\.py" 2>/dev/null || true
+if [ "$START_SYNC" -eq 1 ]; then
+    # The loop holds a pid lock and refuses to start while another copy is
+    # running, so a loop left over from an earlier window would block the
+    # new one.
+    pkill -f "daemon loop" 2>/dev/null || true
+fi
+if command -v lsof >/dev/null 2>&1; then
+    for port in 8090 8092; do
+        pid="$(lsof -ti:$port 2>/dev/null || true)"
+        [ -n "$pid" ] && kill $pid 2>/dev/null || true
+    done
+fi
+sleep 1
+
+# Each supervised process is started by one function, used both for the
+# first start and for every restart, so the two can never drift apart.
+PB_PID=""
+PF_PID=""
+SYNC_PID=""
+
+start_pocketbase() {
+    "$PB_BIN" serve --dir="$PB_DATA" --http="$PB_ADDR" &
+    PB_PID=$!
+}
+
+start_files_server() {
+    HOST=127.0.0.1 SS_FOLDERS_PATH="$SS_FOLDERS" node "$PF_SERVER" > "$REPO/logs/project-files-server.log" 2>&1 &
+    PF_PID=$!
+}
+
+# The loop's console goes to /dev/null on purpose. Everything it has to say
+# goes through its logger into logs/daemon.log, which rotates at 10 MB.
+# Appending the console to a second file would duplicate that log with
+# nothing to rotate it. A crash before logging starts is still noticed,
+# because the supervise loop sees the process is gone.
+start_sync() {
+    "$PY" -m daemon loop --write > /dev/null 2>&1 &
+    SYNC_PID=$!
+}
+
+# ==================================================================
+# 1. PocketBase
+# ==================================================================
+start_pocketbase
+
+PB_READY=0
+for _ in $(seq 1 20); do
+    if ! kill -0 "$PB_PID" 2>/dev/null; then
+        fail "PocketBase exited on startup. Port 8090 may still be held."
+        break
+    fi
+    if curl -sf "$PB_URL/api/health" > /dev/null 2>&1; then
+        PB_READY=1
+        break
+    fi
+    sleep 0.5
+done
+if [ "$PB_READY" -eq 0 ]; then
+    fail "PocketBase did not start. Stopping here."
+    kill "$PB_PID" 2>/dev/null || true
+    exit 1
+fi
+
+# Does this database hold the schema? 200 means the clients collection is
+# there and public, 401 or 403 that it is there and wants auth. 404 means it
+# is missing, which means the wrong data folder or a database the migrations
+# never ran on, and the sync daemon must not start writing into that.
+HTTP_CODE="$(curl -s -o /dev/null -w '%{http_code}' \
+    "$PB_URL/api/collections/clients/records?perPage=1" 2>/dev/null || echo 000)"
+case "$HTTP_CODE" in
+    200|401|403)
+        say "PocketBase is up on $PB_ADDR and has the clients collection (HTTP $HTTP_CODE)."
+        ;;
+    404)
+        fail "PocketBase started but the clients collection is missing."
+        fail "Data folder: $PB_DATA"
+        fail "Stopping before the sync daemon can write into an empty database."
+        kill "$PB_PID" 2>/dev/null || true
+        exit 1
+        ;;
+    *)
+        warn "Unexpected HTTP $HTTP_CODE from the clients collection. Carrying on."
+        ;;
+esac
+
+# ==================================================================
+# 2. Project files server
+# ==================================================================
+start_files_server
+for _ in $(seq 1 20); do
+    curl -sf "$FILES_URL/api/health" > /dev/null 2>&1 && break
+    sleep 0.5
+done
+if curl -sf "$FILES_URL/api/health" > /dev/null 2>&1; then
+    say "Files server is up on 8092."
+else
+    warn "The files server did not answer on 8092. See logs/project-files-server.log"
+fi
+
+# ==================================================================
+# 3 and 4. Guards
+# ==================================================================
+# The guards are not supervised and a failure to start them does not stop
+# the stack: they tidy up stray files, and the rest works without them.
+GUARD_PID=""
+DELIV_GUARD_PID=""
+
+start_guards() {
+    if [ -f "$GUARD_SCRIPT" ]; then
+        SS_FOLDERS_PATH="$SS_FOLDERS" "$PY" "$GUARD_SCRIPT" > "$REPO/logs/ss-folders-guard.log" 2>&1 &
+        GUARD_PID=$!
+    fi
+    if [ -f "$DELIV_GUARD_SCRIPT" ]; then
+        SS_FOLDERS_PATH="$SS_FOLDERS" "$PY" "$DELIV_GUARD_SCRIPT" > "$REPO/logs/ss-deliverables-guard.log" 2>&1 &
+        DELIV_GUARD_PID=$!
+    fi
+}
+
+if [ "$START_GUARDS" -eq 1 ]; then
+    start_guards
+else
+    say "Guards not started (--no-guards)."
+fi
+
+# ==================================================================
+# 5. Sync daemon
+# ==================================================================
+if [ "$START_SYNC" -eq 1 ]; then
+    start_sync
+    say "Sync daemon started. Log: logs/daemon.log"
+fi
+
+# ==================================================================
+# 6. Dashboard
+# ==================================================================
+# Chrome is asked for by name because a plain `open` uses the system default
+# browser, which may open the page in a window that is not in front.
+if [ -f "$DASHBOARD" ] && [ "$OPEN_DASHBOARD" -eq 1 ]; then
+    if open -a "Google Chrome" "$DASHBOARD" 2>/dev/null; then
+        say "Dashboard opened in Chrome."
+    else
+        open "$DASHBOARD" 2>/dev/null || true
+        say "Chrome was not found, so the dashboard opened in the default browser."
+    fi
+fi
+
+echo ""
+say "Splatt stack is running."
+say "  PocketBase   $PB_URL/_/"
+say "  Files API    $FILES_URL"
+say "  SS Folders   $SS_FOLDERS"
+say "  Close this window or press Ctrl+C to stop everything."
+echo ""
+say "PIDs: pb=$PB_PID files=$PF_PID${SYNC_PID:+ sync=$SYNC_PID}${GUARD_PID:+ guard=$GUARD_PID}${DELIV_GUARD_PID:+ deliverables=$DELIV_GUARD_PID}"
+echo ""
+
+STOPPING=0
+cleanup() {
+    [ "$STOPPING" -eq 1 ] && return
+    STOPPING=1
+    echo ""
+    say "Shutting down..."
+    local pid
+    for pid in "${SYNC_PID:-}" "${GUARD_PID:-}" "${DELIV_GUARD_PID:-}" \
+               "${PF_PID:-}" "${PB_PID:-}"; do
+        [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+    done
+    # Wait for each process to exit. Returning straight away can leave port
+    # 8090 held for a moment, and the next start would then fail with
+    # "PocketBase exited on startup".
+    for pid in "${SYNC_PID:-}" "${GUARD_PID:-}" "${DELIV_GUARD_PID:-}" \
+               "${PF_PID:-}" "${PB_PID:-}"; do
+        [ -n "$pid" ] && wait "$pid" 2>/dev/null || true
+    done
+    say "Stopped. You can close this window."
+}
+# INT and TERM exit, and the exit runs cleanup once. A trap that only ran
+# cleanup would return into the supervise loop below, which would then see
+# every process gone and start them all again.
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# ==================================================================
+# Supervise
+# ==================================================================
+# Every 2 seconds, check that PocketBase, the files server and the sync
+# daemon are still alive, and restart any that exited. Each gets RESTART_CAP
+# restarts inside RESTART_WINDOW seconds. A process that exits once (after
+# the machine wakes, for example) comes straight back. One that keeps
+# exiting has a real fault, so the loop stops and the trap above shuts the
+# stack down rather than restarting it forever.
+RESTART_CAP=5
+RESTART_WINDOW=600
+
+pb_fails=0;   pb_since=$(date +%s)
+pf_fails=0;   pf_since=$(date +%s)
+sync_fails=0; sync_since=$(date +%s)
+
+# Succeeds while a process still has restarts left. Once RESTART_WINDOW has
+# passed since its first failure the allowance starts again, so a process
+# that exits twice a week is never treated as a crash loop.
+within_cap() {
+    local fails=$1 since=$2 now
+    now=$(date +%s)
+    [ $(( now - since )) -gt "$RESTART_WINDOW" ] && return 0
+    [ "$fails" -lt "$RESTART_CAP" ]
+}
+
+set +e
+while true; do
+    now=$(date +%s)
+
+    if ! kill -0 "$PB_PID" 2>/dev/null; then
+        echo ""
+        warn "PocketBase ($PB_PID) exited."
+        if within_cap "$pb_fails" "$pb_since"; then
+            [ $(( now - pb_since )) -gt "$RESTART_WINDOW" ] && { pb_fails=0; pb_since=$now; }
+            pb_fails=$(( pb_fails + 1 ))
+            start_pocketbase
+            say "PocketBase restarted as $PB_PID (attempt $pb_fails of $RESTART_CAP)"
+            sleep 2
+        else
+            fail "PocketBase exited $RESTART_CAP times in under $RESTART_WINDOW seconds."
+            fail "Not restarting it again."
+            break
+        fi
+    fi
+
+    if ! kill -0 "$PF_PID" 2>/dev/null; then
+        echo ""
+        warn "Files server ($PF_PID) exited. See logs/project-files-server.log"
+        if within_cap "$pf_fails" "$pf_since"; then
+            [ $(( now - pf_since )) -gt "$RESTART_WINDOW" ] && { pf_fails=0; pf_since=$now; }
+            pf_fails=$(( pf_fails + 1 ))
+            start_files_server
+            say "Files server restarted as $PF_PID (attempt $pf_fails of $RESTART_CAP)"
+            sleep 2
+        else
+            fail "Files server exited $RESTART_CAP times in under $RESTART_WINDOW seconds."
+            fail "See logs/project-files-server.log. Not restarting it again."
+            break
+        fi
+    fi
+
+    if [ -n "$SYNC_PID" ] && ! kill -0 "$SYNC_PID" 2>/dev/null; then
+        echo ""
+        warn "Sync daemon ($SYNC_PID) exited."
+        if within_cap "$sync_fails" "$sync_since"; then
+            [ $(( now - sync_since )) -gt "$RESTART_WINDOW" ] && { sync_fails=0; sync_since=$now; }
+            sync_fails=$(( sync_fails + 1 ))
+            start_sync
+            say "Sync daemon restarted as $SYNC_PID (attempt $sync_fails of $RESTART_CAP). Log: logs/daemon.log"
+            sleep 2
+        else
+            fail "Sync daemon exited $RESTART_CAP times in under $RESTART_WINDOW seconds."
+            fail "See logs/daemon.log. Not restarting it again."
+            break
+        fi
+    fi
+
+    sleep 2
+done
+
+# Only reached when a process used up its restarts, which is a fault.
+exit 1

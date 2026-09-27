@@ -1,0 +1,49 @@
+# Secrets. Copy .env.example to .env; the real file is never committed.
+.env
+
+# Runtime output: logs, state files, reports and database backups. Backups
+# hold every record in the database, so they stay on the machine.
+*.log
+logs/
+state/
+reports/
+backups/
+
+# The database. pb_data/ holds every record and uploaded file; /pocketbase
+# is the downloaded binary (anchored so only the one at the repo root is
+# ignored). Neither belongs in git.
+pb_data/
+/pocketbase
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+
+# Node: installed by `npm install` from package.json.
+node_modules/
+
+# The hosted dashboard bundle, rebuilt by tools/snapshot_build.py.
+dist/
+
+# The local dashboard config, which holds the Todoist token.
+# dashboard/config.example.js is the committed template.
+dashboard/config.local.js
+
+# The folder guards' memory of files already handled on this machine.
+.ss_folders_guard_state.json
+.ss_deliverables_guard_state.json
+guards/.ss_*_guard_state.json
+
+# Scratch copies of the dashboard page and throwaway test mutation scripts.
+dashboard/index.backup-*.html
+dashboard/index.rejected-*.html
+tests/mutate_*.py
+
+# Editor and operating system files.
+.DS_Store
+.vscode/
+.idea/
+.fuse_hidden*

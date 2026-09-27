@@ -1,0 +1,181 @@
+# Playbook: price-leak-guard
+#
+# The check that runs before any client-facing message that contains a
+# figure. It loads the supplier list and net prices from every
+# _Suppliers/*/RELATIONSHIP.md and scans the outbound text for them:
+# exact matches, matches within 2%, and matches after currency conversion.
+# A match blocks the message and is shown to the operator with its
+# location and a suggested marked-up replacement.
+#
+# Run by the splatt-email skill before handing over a client email that
+# contains a figure, and by splatt-ss-agent before a quote document or a
+# Telegram message with figures.
+
+id: price-leak-guard
+version: 1
+last_updated: 2026-05-10
+chained_with:
+  - splatt-email                # run before a client email with figures
+  - issue-quote                 # if a quote issuing playbook is added
+
+description: |
+  Splatt's margin is the difference between the supplier's net price and
+  the client's price. This playbook stops any outbound message that would
+  show a client a supplier figure, whether exact, within 2%, or converted
+  into the client's currency.
+
+inputs:
+  required:
+    - outbound_text              # the full body of the email, quote text or message
+    - recipient_addresses        # a list of email addresses
+    - outbound_type              # email | quote_pdf | telegram | document
+  optional:
+    - splatt_markup_factor       # used for the suggested replacement, when known
+    - fx_rate_overrides          # currency pair -> rate, instead of a live rate
+    - skip_guard                 # true only if the operator said "skip the guard" in the same turn
+    - sign_off_token             # the operator's explicit sign-off, for a sensitive client
+
+steps:
+
+  - id: 1_classify_recipient
+    description: |
+      Classify each address in recipient_addresses:
+        - is_client: the domain belongs to an active client (splatt-clients,
+          PocketBase)
+        - is_internal: a Splatt address or a known internal forwarder
+        - is_vendor: a supplier domain (the guard does not apply to mail
+          going to suppliers)
+        - sensitive_account: the client is flagged critical in PocketBase
+      Record recipients_classified (a list of {address, role}),
+      any_client_recipients (true or false) and sensitive_account
+      (true or false).
+    validates:
+      - type: extracted_fields
+        fields: [recipients_classified, any_client_recipients, sensitive_account]
+
+  - id: 2_load_supplier_price_corpus
+    description: |
+      Read every _Suppliers/*/RELATIONSHIP.md. From each, take the Active
+      Quotes / Indicative Pricing sections and the notes column of
+      Documents on File, and extract every money figure with:
+        {raw_text, currency, amount, basis (list|net|line_item),
+         tax_basis, vendor, model, source_file}
+      Include base prices, discounted net prices and every option line
+      (for example "extra filling valve, EUR 1,000" in an options table).
+      Record supplier_corpus (a list) and corpus_size. corpus_size of 0 is
+      a hard failure: there is always at least one supplier price on file.
+    validates:
+      - type: extracted_fields
+        fields: [supplier_corpus, corpus_size, vendors_seen]
+
+  - id: 3_normalize_outbound
+    description: |
+      Find every number in outbound_text that looks like money:
+        - after a currency symbol or code ($, USD, EUR, NZD, AUD, GBP,
+          ZAR, £, €)
+        - before a currency code
+        - shaped like an amount (3,000 / 3000.00 / 12,500)
+      For each record {raw, currency_or_unknown, amount_normalized,
+      location_in_text}, where location_in_text is the surrounding
+      sentence quoted exactly. Record outbound_figures.
+    validates:
+      - type: extracted_fields
+        fields: [outbound_figures]
+
+  - id: 4_exact_match_scan
+    description: |
+      Compare each outbound figure with supplier_corpus after removing
+      currency symbols, separators, trailing decimal zeros and spaces. An
+      exact match is the same currency and the same amount. Record
+      exact_matches (a list of {outbound, supplier_entry, location}) and
+      exact_match_count.
+    validates:
+      - type: extracted_fields
+        fields: [exact_matches, exact_match_count]
+
+  - id: 5_near_match_scan
+    description: |
+      For each outbound figure with a known currency, find supplier
+      figures in the same currency within 2% of it, leaving out the exact
+      matches from step 4. Record near_matches and near_match_count.
+    validates:
+      - type: extracted_fields
+        fields: [near_matches, near_match_count]
+
+  - id: 6_fx_converted_match_scan
+    description: |
+      For each supplier figure in currency A and each outbound figure in a
+      different currency B:
+        - convert the supplier amount from A to B, using
+          fx_rate_overrides[A->B] when given and the current rate otherwise
+        - flag it when the outbound figure is within 2% of the result
+      Record fx_matches (a list of {supplier, outbound, fx_rate,
+      converted_amount}), fx_match_count and fx_rates_used.
+    validates:
+      - type: extracted_fields
+        fields: [fx_matches, fx_match_count, fx_rates_used]
+
+  - id: 7_verdict
+    description: |
+      Work out the verdict, top to bottom:
+        skip_guard=true, set by the operator in this turn → PASS_OVERRIDDEN
+        any_client_recipients=false and no vendor recipients → PASS_INTERNAL
+        exact_match_count > 0 → BLOCK
+        near_match_count > 0 → FLAG
+        fx_match_count > 0 → FLAG
+        sensitive_account=true and outbound_figures not empty and no sign_off_token → REQUIRE_SIGN_OFF
+        otherwise → PASS
+      For BLOCK, FLAG and REQUIRE_SIGN_OFF, work out
+      suggested_replacement_or_null:
+        - with splatt_markup_factor: supplier net × markup factor
+        - without it: null, with the note "ask the operator for the markup"
+      Record verdict, reason, suggested_replacement_or_null and
+      offending_supplier_entry_or_null.
+    validates:
+      - type: extracted_fields
+        fields: [verdict, reason, suggested_replacement_or_null]
+
+  - id: 8_emit_decision
+    description: |
+      Show the verdict to the operator:
+        PASS or PASS_INTERNAL  → one line of confirmation; the message may go
+        PASS_OVERRIDDEN        → one line of confirmation, and the override is logged
+        BLOCK                  → the message may not go. Show:
+                                    - the supplier figure that matched
+                                    - the RELATIONSHIP.md it came from
+                                    - the outbound sentence it is in
+                                    - the suggested replacement, or a note
+                                      to ask the operator for the markup
+        FLAG                   → show the same as BLOCK; the operator may
+                                  choose to override
+        REQUIRE_SIGN_OFF       → ask the operator for explicit sign-off and
+                                  resubmit only after it is given
+      The playbook never sends anything. Sending happens outside it, and
+      for email the operator does it.
+      Record decision_surfaced_to_user and send_authorized (true only for
+      PASS, PASS_INTERNAL and PASS_OVERRIDDEN).
+    validates:
+      - type: extracted_fields
+        fields: [decision_surfaced_to_user, send_authorized]
+
+failure_modes:
+  - bypass_attempted:
+      severity: HARD_FAIL
+      reason: The guard can only be skipped by an explicit skip_guard input set by the operator in the same turn.
+  - corpus_load_failed:
+      severity: HARD_FAIL
+      reason: With no supplier prices loaded the guard cannot pass. Blocking is better than missing a leak.
+  - exact_match_ignored:
+      severity: HARD_FAIL
+      reason: An exact match always blocks. Ignoring one is a leak.
+  - sensitive_account_no_sign_off:
+      severity: HARD_FAIL
+      reason: A client flagged critical in PocketBase needs the operator's explicit sign-off for any figure.
+  - relationship_md_missing_for_active_supplier:
+      severity: SOFT_FAIL
+      reason: A vendor named in the message has no RELATIONSHIP.md, so the corpus may be incomplete. Show it to the operator and treat it as FLAG.
+
+invariants:
+  - The playbook never edits a supplier RELATIONSHIP.md. It only reads them.
+  - The playbook never sends anything. It only authorises or blocks.
+  - The playbook always runs to step 8, even after an early PASS, so every check is logged.

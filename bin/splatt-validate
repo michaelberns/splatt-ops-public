@@ -1,0 +1,83 @@
+#!/bin/sh
+#
+# bin/splatt-validate: run the validator and exit with its verdict. The
+# agent runs this at the end of every operations run and must obey the exit
+# code.
+#
+# What it does
+#   1. Runs `python -m validator run`, which checks the database and the
+#      write ledger against config/validation-rules.yaml, prints the
+#      verdict, writes the full report to the reports folder, and sends a
+#      Telegram message to the ops channel if anything failed.
+#   2. Runs tools/check_workload_counts.js (when node is installed), which
+#      checks that every count chip on the dashboard's Workload bar matches
+#      the number of rows it opens. A mismatch is printed but never changes
+#      the exit code, because it is a display problem, not a data problem.
+#
+# Exit codes
+#   0  passed (warnings allowed)
+#   1  blocked: the agent may not report the run as a success
+#   2  the validator could not run, which is not a pass
+#
+# Usage
+#   bin/splatt-validate               full pass
+#   bin/splatt-validate --standing    fast pass, safe to run in the middle of a run
+#   bin/splatt-validate --json        machine readable output
+#   bin/splatt-validate --no-notify   same checks, no Telegram message (for testing)
+#
+# Telegram is on by default so a failed run is reported even when nobody is
+# watching the terminal.
+#
+# The interpreter is the repo's .venv/bin/python when it exists, because
+# that is the one requirements.txt installs into. Otherwise python3 on PATH.
+
+set -e
+
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$REPO"
+
+if [ -x "$REPO/.venv/bin/python" ]; then
+  PY="$REPO/.venv/bin/python"
+else
+  PY="python3"
+fi
+
+NOTIFY="--notify"
+ARGS=""
+for arg in "$@"; do
+  if [ "$arg" = "--no-notify" ]; then
+    NOTIFY=""
+  else
+    ARGS="$ARGS $arg"
+  fi
+done
+
+set +e
+# shellcheck disable=SC2086
+"$PY" -m validator run $NOTIFY $ARGS
+CODE=$?
+set -e
+
+# The Workload chips. Checked here rather than in the Python rules because
+# the code that computes the counts is the dashboard's JavaScript. Read only,
+# against the live database.
+if command -v node >/dev/null 2>&1; then
+  set +e
+  COUNTS="$(node tools/check_workload_counts.js 2>&1)"
+  COUNTS_CODE=$?
+  set -e
+  if [ "$COUNTS_CODE" -eq 1 ]; then
+    echo ""
+    echo "Workload chips disagree with their rows:"
+    echo "$COUNTS" | grep -E 'MISMATCH' | head -20
+    echo "Run: node tools/check_workload_counts.js"
+  fi
+fi
+
+if [ "$CODE" -eq 2 ]; then
+  echo ""
+  echo "The validator could not run. This is NOT a pass."
+  echo "Do not report success. Run: $PY -m validator doctor"
+fi
+
+exit $CODE

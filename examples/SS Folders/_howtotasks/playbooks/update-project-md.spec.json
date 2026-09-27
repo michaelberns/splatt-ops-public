@@ -1,0 +1,49 @@
+{
+  "playbook_id": "update-project-md",
+  "version": 1,
+  "trigger": "manual_or_subroutine",
+  "description": "Add one dated update to a project's PROJECT.md: a Communications Log row plus the matching change in Quotes, Supplier Orders, Key Decisions or Documents. Rule: only ever append rows; never delete or rewrite existing rows.",
+  "inputs_required": ["project_path", "update_type", "update_summary"],
+  "steps": [
+    {
+      "id": "1_verify_project_path",
+      "description": "Confirm project_path exists and contains a PROJECT.md. Capture project_md_path and project_md_existed_before_run (must be true).",
+      "validates": [
+        { "type": "extracted_fields", "fields": ["project_md_path", "project_md_existed_before_run"] }
+      ]
+    },
+    {
+      "id": "2_classify_update_type",
+      "description": "Check update_type is one of comms_log_only, new_quote, supplier_order_change, key_decision, document_added, status_change. Capture update_type_validated and target_sections (the list of sections that will change).",
+      "validates": [
+        { "type": "extracted_fields", "fields": ["update_type_validated", "target_sections"] }
+      ]
+    },
+    {
+      "id": "3_compose_comms_log_row",
+      "description": "Write the new Communications Log row in the format '| YYYY-MM-DD | IN or OUT | Who | Subject | Summary |'. Capture comms_log_row.",
+      "validates": [
+        { "type": "extracted_fields", "fields": ["comms_log_row"] }
+      ]
+    },
+    {
+      "id": "4_compose_section_changes",
+      "description": "For each section in target_sections, write the exact lines to append. Capture section_changes (an object mapping section name to the new lines).",
+      "validates": [
+        { "type": "extracted_fields", "fields": ["section_changes"] }
+      ]
+    },
+    {
+      "id": "5_apply_md_edits",
+      "description": "Append comms_log_row and section_changes to PROJECT.md and update the 'Last Updated' line. Keep every existing line. Capture pre_edit_byte_size, post_edit_byte_size (must not be smaller) and lines_added.",
+      "validates": [
+        { "type": "file_modified", "path": "$inputs.project_path/PROJECT.md", "since": "$run.started_at" },
+        { "type": "extracted_fields", "fields": ["pre_edit_byte_size", "post_edit_byte_size", "lines_added"] }
+      ]
+    }
+  ],
+  "final_validation": [
+    { "type": "file_modified", "path": "$inputs.project_path/PROJECT.md", "since": "$run.started_at" },
+    { "type": "extracted_fields", "fields": ["lines_added"] }
+  ]
+}

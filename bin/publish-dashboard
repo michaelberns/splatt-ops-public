@@ -1,0 +1,224 @@
+#!/usr/bin/env bash
+#
+# bin/publish-dashboard: build a read-only snapshot of the dashboard and
+# publish it to Cloudflare Pages.
+#
+# Usage
+#   bin/publish-dashboard                  build and publish
+#   bin/publish-dashboard --build-only     build the dist/ folder and stop
+#   bin/publish-dashboard --no-logs        leave the daemon log tails out
+#   bin/publish-dashboard --trigger cron   who asked (dashboard, cron,
+#                                          terminal or ops), for the log row
+#
+# The two steps
+#   1. tools/snapshot_build.py reads every PocketBase collection and files
+#      server endpoint the dashboard uses into dist/snapshot.json, and copies
+#      the page files beside it. It only reads, so it cannot change
+#      PocketBase, Todoist or anything on disk.
+#   2. wrangler uploads dist/ to the Cloudflare Pages project.
+#
+# Every run is recorded. tools/publish_log.py opens a row in the publish_log
+# collection before step 1 and closes it after step 2, whichever way the run
+# went, so the dashboard's Publish page shows the history, failed scheduled
+# runs included. If PocketBase is unreachable the recording is skipped and
+# the publish carries on.
+#
+# Output goes both to logs/publish-dashboard.current (the current run, which
+# the dashboard shows while it runs) and to logs/publish-dashboard.log.
+# state/publish.lock allows one publish at a time.
+#
+# Settings read from .env
+#   CLOUDFLARE_API_TOKEN     a token with the "Cloudflare Pages: Edit" permission
+#   CLOUDFLARE_ACCOUNT_ID    shown on the right of any Cloudflare dashboard page
+#   CF_PAGES_PROJECT         optional, the Pages project name (default splatt-ops-demo)
+#   PB_ADMIN_EMAIL           only needed to write the log row
+#   PB_ADMIN_PASSWORD        same
+#
+# Exit codes: 0 published (or built, with --build-only), 1 failed, 3 another
+# publish is already running, 130 interrupted.
+#
+# The hosted page has no backend and no write path. Who may open it is
+# controlled by Cloudflare Access, not by this script. See
+# docs/HOSTED-DASHBOARD.md.
+
+set -uo pipefail
+
+# cron starts with a minimal PATH that does not include Homebrew, so node
+# and npx would not be found by a scheduled run.
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO" || exit 1
+
+BUILD_ONLY=0
+BUILD_ARGS=()
+TRIGGER="terminal"
+NEXT_IS_TRIGGER=0
+for arg in "$@"; do
+  if [ "$NEXT_IS_TRIGGER" = "1" ]; then TRIGGER="$arg"; NEXT_IS_TRIGGER=0; continue; fi
+  case "$arg" in
+    --build-only) BUILD_ONLY=1 ;;
+    --no-logs)    BUILD_ARGS+=("--no-logs") ;;
+    --trigger)    NEXT_IS_TRIGGER=1 ;;
+    --trigger=*)  TRIGGER="${arg#--trigger=}" ;;
+    *) echo "unknown option: $arg"; exit 1 ;;
+  esac
+done
+
+LOGS_DIR="$REPO/logs"
+STATE_DIR="$REPO/state"
+RUN_LOG="$LOGS_DIR/publish-dashboard.current"
+MAIN_LOG="$LOGS_DIR/publish-dashboard.log"
+LOCK="$STATE_DIR/publish.lock"
+mkdir -p "$LOGS_DIR" "$STATE_DIR"
+
+# The script re-runs itself with its output piped through tee, into the
+# per-run file the dashboard shows and onto the end of the long log. Doing it
+# here rather than in a crontab redirect means runs started from the
+# dashboard, cron or a terminal are all logged the same way.
+if [ -z "${SPLATT_PUBLISH_TEE:-}" ]; then
+  export SPLATT_PUBLISH_TEE=1
+  : > "$RUN_LOG"
+  "$0" "$@" 2>&1 | tee "$RUN_LOG" | tee -a "$MAIN_LOG"
+  exit "${PIPESTATUS[0]}"
+fi
+
+# One publish at a time. With two uploads racing, whichever finished last
+# would be on the site, and it may not be the newer snapshot.
+if [ -f "$LOCK" ]; then
+  OTHER="$(cat "$LOCK" 2>/dev/null)"
+  if [ -n "$OTHER" ] && kill -0 "$OTHER" 2>/dev/null; then
+    echo "A publish is already running (pid $OTHER). Nothing started."
+    exit 3
+  fi
+  echo "Clearing a stale lock from pid ${OTHER:-unknown}."
+  rm -f "$LOCK"
+fi
+echo $$ > "$LOCK"
+
+START_TS="$(date +%s)"
+
+say() { printf '\n\033[1m%s\033[0m\n' "$*"; }
+
+# .env holds the Cloudflare credentials. It is read, never written.
+if [ -f "$REPO/.env" ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . "$REPO/.env"
+  set +a
+fi
+
+RUN_ID="$(python3 -m tools.publish_log start --trigger "$TRIGGER" 2>/dev/null | tail -1)"
+
+# Close the log row and remove the lock. Called on success, from die(), and
+# from the INT/TERM trap, so an early failure is recorded as well.
+finish() {
+  local status="$1" errtext="${2:-}"
+  local args=(finish --id "$RUN_ID" --status "$status"
+              --duration "$(( $(date +%s) - START_TS ))"
+              --output-file "$RUN_LOG")
+  [ -n "$errtext" ] && args+=(--error "$errtext")
+  if [ -s "$REPO/dist/snapshot.json" ]; then
+    local stats
+    stats="$(python3 -m tools.publish_log stats --snapshot "$REPO/dist/snapshot.json" 2>/dev/null)"
+    if [ -n "$stats" ]; then
+      args+=(--snapshot-at "$(printf '%s' "$stats" | python3 -c 'import sys,json;print(json.load(sys.stdin)["generated_at"])' 2>/dev/null)")
+      args+=(--records "$(printf '%s' "$stats" | python3 -c 'import sys,json;print(json.load(sys.stdin)["records"])' 2>/dev/null)")
+      args+=(--collections "$(printf '%s' "$stats" | python3 -c 'import sys,json;print(json.load(sys.stdin)["collections"])' 2>/dev/null)")
+      args+=(--size-kb "$(printf '%s' "$stats" | python3 -c 'import sys,json;print(json.load(sys.stdin)["size_kb"])' 2>/dev/null)")
+    fi
+  fi
+  [ -n "${DEPLOY_URL:-}" ] && args+=(--deploy-url "$DEPLOY_URL")
+  python3 -m tools.publish_log "${args[@]}" >/dev/null 2>&1 || true
+  rm -f "$LOCK"
+}
+
+die() {
+  printf '\n\033[31m%s\033[0m\n' "$*"
+  finish failed "$*"
+  exit 1
+}
+
+# An interrupted run must not leave the row saying "running" and the lock
+# claiming a publish is still in progress.
+trap 'finish failed "The run was interrupted."; exit 130' INT TERM
+
+# wrangler depends on workerd, a native binary that must match this
+# machine's operating system and processor. npm installs the build for the
+# platform npm ran on, so a node_modules folder installed on another
+# platform (for example a Linux container sharing this folder) has an empty
+# workerd folder for this one. wrangler then fails with an error that does
+# not mention the cause, so the binary is checked here first.
+if [ "$BUILD_ONLY" = "0" ] && [ -d "$REPO/node_modules/workerd" ]; then
+  case "$(uname -s)" in Darwin) WD_OS=darwin ;; Linux) WD_OS=linux ;; *) WD_OS="" ;; esac
+  case "$(uname -m)" in arm64|aarch64) WD_ARCH=arm64 ;; x86_64|amd64) WD_ARCH=64 ;; *) WD_ARCH="" ;; esac
+  if [ -n "$WD_OS" ] && [ -n "$WD_ARCH" ]; then
+    WD_PKG="@cloudflare/workerd-$WD_OS-$WD_ARCH"
+    if [ ! -s "$REPO/node_modules/$WD_PKG/bin/workerd" ]; then
+      echo
+      echo "  wrangler needs $WD_PKG and this repo does not have it."
+      echo "  The folder is there but empty, which means npm install was run"
+      echo "  on a different platform. Run it again on this machine:"
+      echo
+      echo "    cd $REPO && npm install"
+      echo
+      die "Not published: the wrangler install is for the wrong platform."
+    fi
+  fi
+fi
+
+say "1/2  Building the snapshot"
+python3 -m tools.snapshot_build --out "$REPO/dist" "${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"}" \
+  || die "The build failed. Is the stack running? Start it with: bin/start"
+
+[ -s "$REPO/dist/snapshot.json" ] || die "dist/snapshot.json is empty. Nothing to publish."
+
+# Neither the hosted config nor the snapshot may carry the Todoist token.
+if grep -Eq 'TODOIST_TOKEN: "[^"]' "$REPO/dist/config.local.js" 2>/dev/null; then
+  die "The hosted config has a Todoist token in it. Refusing to publish."
+fi
+if grep -rqi "todoist_token\|Bearer [0-9a-f]\{40\}" "$REPO/dist/snapshot.json" 2>/dev/null; then
+  die "A token turned up inside snapshot.json. Refusing to publish."
+fi
+
+if [ "$BUILD_ONLY" = "1" ]; then
+  say "Built only. The bundle is at $REPO/dist"
+  finish success
+  exit 0
+fi
+
+PROJECT="${CF_PAGES_PROJECT:-splatt-ops-demo}"
+
+if [ -z "${CLOUDFLARE_API_TOKEN:-}" ] || [ -z "${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
+  say "2/2  Publishing"
+  echo "  CLOUDFLARE_API_TOKEN or CLOUDFLARE_ACCOUNT_ID is not in .env."
+  echo "  The bundle is built and sitting at $REPO/dist."
+  echo "  Either add both to .env, or publish this once by hand with:"
+  echo
+  echo "    npx wrangler pages deploy dist --project-name=$PROJECT --branch=main"
+  echo
+  die "Not published: the Cloudflare credentials are missing from .env."
+fi
+
+say "2/2  Publishing to Cloudflare Pages project '$PROJECT'"
+# wrangler is a devDependency in package.json, so npx --no-install uses the
+# copy in node_modules and never downloads anything at run time.
+npx --no-install wrangler pages deploy "$REPO/dist" \
+  --project-name="$PROJECT" \
+  --branch=main \
+  --commit-dirty=true \
+  || die "The upload failed. The bundle is still at $REPO/dist, so nothing is lost."
+
+# wrangler prints the address of the new deployment. It is read back from the
+# run log so the history row can link to it.
+DEPLOY_URL="$(grep -Eo 'https://[a-z0-9.-]*\.pages\.dev[^ ]*' "$RUN_LOG" 2>/dev/null | tail -1)"
+
+STAMP="$(python3 -c "import json,io;print(json.load(io.open('$REPO/dist/snapshot.json'))['generated_at'])" 2>/dev/null)"
+say "Published. Snapshot taken $STAMP"
+
+finish success
+
+# Tell the operator on Telegram. send_telegram.py queues the message in its
+# outbox if Telegram is unreachable, and a failure here never fails the run.
+python3 "$REPO/skills/splatt-ss-agent/scripts/send_telegram.py" \
+  --type info "Dashboard snapshot published. Data as of $STAMP" >/dev/null 2>&1 || true

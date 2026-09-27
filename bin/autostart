@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+#
+# bin/autostart: the command the launchd agent runs. Not meant to be typed.
+#
+# bin/install-autostart installs a per-user launchd agent that runs this at
+# login and again whenever it exits. It starts bin/start with two flags:
+#
+#   --only-if-down  If PocketBase and the files server already answer, exit
+#                   and leave that stack alone. Without it, launchd's restart
+#                   timer and a stack started by hand in a terminal would keep
+#                   taking the ports from each other. After a reboot nothing
+#                   is answering, so the stack starts.
+#   --no-dashboard  A restart must not open a new browser tab each time.
+#
+# Restarting a process that died is handled inside bin/start, so it works
+# the same whether the stack was started here or by hand.
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+cd "$REPO"
+
+# bin/start is passed to /bin/bash rather than run through its
+# #!/usr/bin/env shebang. macOS grants Full Disk Access per executable, and
+# the grant that lets this agent read ~/Documents is given to /bin/bash (see
+# bin/install-autostart). Through the shebang, /usr/bin/env would be the
+# process image, it has no grant, and every child process (python included)
+# would be refused. That refusal shows up as "cannot import httpx yaml",
+# because a blocked read and a missing package both make the import fail.
+# Keep the explicit /bin/bash.
+exec /bin/bash "$REPO/bin/start" --no-dashboard --only-if-down
