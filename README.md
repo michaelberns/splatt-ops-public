@@ -1,176 +1,165 @@
 # splatt-ops
 
-An operations system for a small industrial engineering business, built
-around an AI agent whose work is checked by an independent, rule-based
-validator.
+A system that runs the day-to-day operations of a small engineering
+business, with an AI assistant doing the work and ordinary code checking
+that the work was actually done.
 
-The business (Splatt Engineering, which supplies and services bottling and
-food-processing equipment) runs on email, a Todoist board, project
-folders and Xero. This repository connects them: a database of clients,
-jobs, quotes and invoices; a background process that keeps the task board
-and the database in step and escalates overdue work; a dashboard; and an
-AI agent (Claude) that reads email, decides what needs doing and does it.
+> This is a public copy of a system in real daily use. All client,
+> supplier and people names, prices and reference numbers have been
+> replaced with made-up ones.
 
-The interesting part is not the agent on its own. It is how the agent is
-constrained while it works and how its results are checked afterwards, so
-that "the agent said it was done" and "it is done" are forced to be the
-same thing. That design is explained in
-**[docs/HARNESSES.md](docs/HARNESSES.md)**.
+## What it is
 
-> This is the public edition of a system in daily use. Every client,
-> supplier, person, price and reference number in this repository has been
-> replaced with fictional data, and the git history starts at the public
-> release.
+Splatt Engineering supplies and services machines for bottling and food
+factories. Most of its work starts as an email: a client asks for a price,
+a supplier sends a quote, a delivery arrives. Each email means updating
+several places: the to-do list (Todoist), the customer records, the
+project files and the accounts (Xero).
 
-## What it does
+This project connects all of those. It has:
 
-- **Keeps one source of truth per kind of data.** Tasks live in Todoist,
-  relationships and job state in PocketBase, documents in project folders,
-  money in Xero. A daemon mirrors the Todoist board into the database every
-  60 seconds and pushes dashboard edits back.
-- **Moves work forward automatically.** Completing a task marked
-  `🔁 On complete: job to quoted` moves the job to `quoted`. A quote left
-  unanswered for 7 days gets a chase task, scheduled into a free slot.
-- **Escalates overdue work on a ladder** measured from the date a task was
-  *first* due (1 day: move to Overdue, 3: escalate, 7: alert, 28: park as
-  Stalled), and routes tasks that are waiting on a client or supplier into
-  their own columns with business-day chase dates.
-- **Gives an AI agent safe tools.** 31 database tools over MCP, each write
-  checked against the schema before sending and read back after. A
-  playbook engine makes multi-step procedures run in order, with a
-  validator on every step.
-- **Checks everything independently.** A validator with 36 declarative
-  rules (standing checks, per-status gates, and money rules that can never
-  be waived) decides whether a run may be reported as a success. It exits
-  0, 1 or 2, and posts its verdict to its own Telegram channel.
-- **Shows it all on one dashboard**: pipeline, workload board, timeline,
-  map of installed equipment, project files, per-project money ledger, and
-  a streamer mode that masks client data for screen sharing.
+- **a database** of clients, jobs, quotes and invoices,
+- **a background program** that keeps the to-do list and the database in
+  sync and follows up on work that is running late,
+- **a dashboard** that shows everything in one place,
+- **an AI assistant** (Claude) that reads the email and does the updates,
+- **a checker** that confirms the assistant's work is really done.
 
-## Architecture at a glance
+## The problem it solves
+
+An AI assistant is good at understanding things. It can read a long email
+thread and work out that "yes, go ahead with option B" means the client
+accepted the quote.
+
+But it is not reliable at bookkeeping. It can:
+
+- say it saved something when the save failed,
+- skip a step and not notice,
+- report "all done" because it *remembers* doing the work, not because it
+  checked.
+
+Ordinary code is the opposite: it cannot read an email, but it never skips
+a step and can check every claim. So this system gives each side the job
+it is good at.
+
+## How it works
 
 ```mermaid
-flowchart LR
-    Email[Gmail] --> Agent
-    Agent["AI agent<br/>(Claude + skills/)"] -- "MCP: 31 tools<br/>schema check + read-back" --> PB[(PocketBase)]
-    Agent -- "MCP: playbooks<br/>step validators" --> FS[Files server]
-    FS --> Folders[/Project folders/]
-    Todoist[Todoist board] <--> Daemon["Daemon<br/>sync · triggers · overdue ladder"]
-    Daemon <--> PB
-    Daemon --> Ledger[[Write ledger]]
-    Validator["Validator<br/>36 rules"] --> PB
-    Validator --> Ledger
-    Validator --> Folders
-    Validator -- "exit 0 / 1 / 2" --> Agent
-    Validator --> Ops[Ops Telegram]
-    Dashboard --> PB
-    Dashboard --> FS
+flowchart TB
+    A["1. Email arrives"] --> B["2. AI assistant reads it<br/>and decides what to do"]
+    B --> C["3. It makes changes<br/>using safe, limited tools"]
+    C --> D[("Database")]
+    E["Background program<br/>(runs every minute)"] --> D
+    D --> F["4. Checker looks at the result<br/>against 36 business rules"]
+    F -- "pass or fail" --> G["5. The assistant reports<br/>what the checker found"]
+    F --> H["Alert to the owner's phone"]
 ```
 
-| Part | Folder | In one sentence |
-|---|---|---|
-| Shared library | [`core/`](core/) | Database and Todoist clients, the write ledger, and pure "planner" modules that decide changes without touching the network. |
-| Daemon | [`daemon/`](daemon/) | The always-on loop: sync, reverse sync, triggers, the overdue ladder, backups, Telegram outbox. |
-| Validator | [`validator/`](validator/), [`config/validation-rules.yaml`](config/validation-rules.yaml) | The independent checker that decides whether the agent may report success. |
-| Agent tools | [`mcp_server/`](mcp_server/), [`playbook_mcp/`](playbook_mcp/) | What the agent is allowed to call. |
-| Agent instructions | [`skills/`](skills/) | The Markdown "skills" Claude loads: hard rules, the ops cycle, data conventions. |
-| Files and playbook server | [`server/`](server/) | Node server for project files, the playbook state machine, logs and the dashboard's feeds. |
-| Dashboard | [`dashboard/`](dashboard/) | A single-file React app with four tested helper engines. |
-| Tools | [`tools/`](tools/) | Schema introspection, backups, demo data, Todoist setup, the skill harness, the hosted-dashboard build. |
+1. **An email arrives.** The AI assistant reads it and decides what needs
+   to happen.
+2. **It makes the changes using limited tools.** It cannot write to the
+   database freely. Every save is checked before it is sent and read back
+   afterwards, so a failed save is reported as a failure.
+3. **Routine work is done by the background program,** not the assistant.
+   Every minute it syncs the to-do list with the database. Once a day it
+   moves overdue tasks up an escalation ladder: overdue after 1 day, marked
+   urgent after 3, an alert after 7, parked after 28.
+4. **At the end, a separate checker reviews the result.** It does not
+   trust anything the assistant says. It reads the database and the
+   project folders itself and applies 36 rules. For example: a job marked
+   "invoiced" must have an invoice, and freight paid to a courier must be
+   charged on to the client.
+5. **The assistant must report the checker's answer,** not its own
+   opinion. If the checker says something is wrong, the assistant is not
+   allowed to say the job is finished. The checker also sends its result
+   straight to the owner's phone (Telegram), so a problem cannot be hidden.
 
-More detail: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
+## What catches what
 
-## The core idea in one paragraph
+| If the AI assistant... | ...this catches it |
+|---|---|
+| saves to a field that does not exist | the tool refuses the save and names the field |
+| says it saved something, but the save failed | the tool reads the record back and reports the failure |
+| skips a step in a multi-step job | the step-by-step "playbook" will not move on without proof |
+| marks a job as invoiced with no invoice | the checker's rules fail the job |
+| forgets to chase a client | the background program creates the reminder itself |
+| reports success while rules are failing | the checker blocks it and alerts the owner directly |
 
-An AI agent is good at judgement (reading a thread and working out that a
-quote was accepted) and bad at bookkeeping (it will report a database
-write that never happened, or skip a step, and then say it is finished).
-Plain code is the reverse. So the agent only gets tools that verify their
-own writes, multi-step jobs run through a state machine that will not
-accept a step without evidence, routine work is taken off the agent by a
-daemon that logs every write it makes, and at the end of every run an
-independent validator re-reads those claims and checks the business rules.
-The agent must report from the validator's verdict, not from memory, and
-the validator reports to the operator directly as well. Where the code is
-unsure (two clients match a name, an email only *probably* confirms a
-delivery), it refuses rather than guesses and hands the case to the agent,
-whose decision then goes through the same checks. The full explanation,
-with a table of which layer catches which failure, is in
-[docs/HARNESSES.md](docs/HARNESSES.md).
+When the code is unsure (for example, two clients have similar names), it
+does not guess. It leaves the decision to the assistant or the owner, and
+that decision is then checked like everything else.
 
-## Quick start (demo, about 10 minutes)
+The full explanation is in **[docs/HARNESSES.md](docs/HARNESSES.md)**.
 
-Needs Python 3.10+ (macOS ships 3.9, so install a newer one first), Node 18+
-and the PocketBase 0.25 binary. No accounts.
+## What's in this repository
+
+| Folder | What it holds |
+|---|---|
+| [`core/`](core/) | Shared code: talking to the database and Todoist, and the logic for matching tasks to clients and jobs |
+| [`daemon/`](daemon/) | The background program (sync, reminders, overdue ladder, backups) |
+| [`validator/`](validator/) | The checker. Its rules are in [`config/validation-rules.yaml`](config/validation-rules.yaml) |
+| [`mcp_server/`](mcp_server/), [`playbook_mcp/`](playbook_mcp/) | The limited tools the AI assistant is allowed to use |
+| [`skills/`](skills/) | The written instructions the AI assistant follows |
+| [`server/`](server/) | A small server for project files and step-by-step playbooks |
+| [`dashboard/`](dashboard/) | The dashboard (a single web page) |
+| [`tools/`](tools/) | Helper scripts: demo data, setup, backups |
+| [`tests/`](tests/) | About 1,200 automated tests |
+
+How the parts fit together: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
+
+## Try it
+
+You can run a demo with a made-up business in about 10 minutes, without
+any accounts. You need Python 3.10 or newer, Node.js 18 or newer, and the
+free PocketBase database program.
+
+Follow **Part A** of **[docs/INSTALL.md](docs/INSTALL.md)**. You will get
+the dashboard with sample clients, jobs, overdue tasks and a map of
+installed machines, and you can run the checker to see it find problems
+in the sample data.
+
+<details>
+<summary>Short version of the demo commands (macOS, Apple Silicon)</summary>
 
 ```bash
 git clone https://github.com/michaelberns/splatt-ops-public.git && cd splatt-ops-public
-python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt   # any Python 3.10+
+python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
-# PocketBase (Apple Silicon shown; see docs/INSTALL.md for other platforms)
 curl -L -o pb.zip https://github.com/pocketbase/pocketbase/releases/download/v0.25.9/pocketbase_0.25.9_darwin_arm64.zip
 unzip -o pb.zip pocketbase && rm pb.zip
-
 ./pocketbase superuser upsert admin@example.com 'choose-a-long-password' --dir pb_data
-cp .env.example .env        # then set PB_ADMIN_EMAIL and PB_ADMIN_PASSWORD
+cp .env.example .env                  # then fill in PB_ADMIN_EMAIL and PB_ADMIN_PASSWORD
 cp dashboard/config.example.js dashboard/config.local.js
 
 ./pocketbase serve --http=127.0.0.1:8090 --dir=pb_data &
-.venv/bin/python -m tools.seed_demo --write                    # fictional demo business
+.venv/bin/python -m tools.seed_demo --write
 SS_FOLDERS_PATH="$PWD/examples/SS Folders" node server/project-files-server.js &
 open dashboard/index.html
 
-SPLATT_ROOT="$PWD/examples" .venv/bin/python -m validator run --no-todoist   # see the validator at work
+SPLATT_ROOT="$PWD/examples" .venv/bin/python -m validator run --no-todoist
 ```
 
-Step-by-step instructions, the full setup with Todoist, Telegram and
-Claude, and troubleshooting: **[docs/INSTALL.md](docs/INSTALL.md)**.
+</details>
 
-## Tests
+## Running the tests
 
 ```bash
-.venv/bin/python -m pytest      # about 1,200 tests, offline
-npm install && npm test         # the dashboard engine suites
+.venv/bin/python -m pytest
 ```
 
-Almost everything runs offline against a fake PocketBase and a fake
-Todoist (`tests/fakes.py`). The dashboard, which is compiled by Babel in
-the browser, is compiled during the test run so a syntax error fails a
-test instead of a page load.
+The tests run offline, using fake versions of the database and Todoist.
 
-## Tech stack
+## Built with
 
-Python 3.12 (httpx, PyYAML, the MCP SDK, pytest) · PocketBase 0.25 (SQLite)
-· Node 22 (files server, no dependencies) · React 18, Tailwind and Leaflet
-in a single HTML file · Todoist API v1 · Telegram Bot API · Claude (MCP
-servers and skills) · Cloudflare Pages for the optional hosted copy.
+Python, PocketBase (database), Node.js, React (dashboard), the Todoist and
+Telegram APIs, and Claude with the Model Context Protocol (MCP) for the AI
+assistant.
 
-## Design decisions worth pointing out
+## Further reading
 
-- **Refuse rather than guess.** Every automatic linker (client matching,
-  job matching, "does this email prove the task is done") returns a
-  refusal with a reason when it is not sure. A wrong automatic link is
-  harder to find than a missing one.
-- **Claims are separate from facts.** Writers append what they claim to
-  have written to a ledger; the validator re-reads the database to decide
-  whether it is true. The code that did the work never marks its own work.
-- **Nothing is deleted automatically.** The daemon marks, moves and
-  escalates; completing or deleting is left to a person or to an explicit
-  rule.
-- **Configuration in one place.** Every port, id, path and threshold is in
-  `config/settings.yaml`, every secret in `.env`, every validation rule in
-  `config/validation-rules.yaml`. The database schema is generated into
-  `core/schema.py`, and a rule fails if the two drift.
-- **Waivers expire.** A bypass lasts 72 hours; a temporary exception must
-  have an end date no more than 90 days away. Money rules cannot be waived.
-
-## Known limitations
-
-Listed honestly in [docs/HARNESSES.md](docs/HARNESSES.md#6-known-limitations).
-The main one: writes the agent makes through the MCP tools are verified at
-the moment they happen but are not added to the write ledger, so the
-validator checks their *result* (through its business rules) but does not
-re-read each one individually.
+- [docs/INSTALL.md](docs/INSTALL.md): step-by-step setup, from demo to full use
+- [docs/HARNESSES.md](docs/HARNESSES.md): how the AI and the checker keep each other honest, and the current limitations
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): every part of the system in detail
 
 ## Author
 
