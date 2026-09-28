@@ -1,125 +1,102 @@
 # splatt-ops
 
-A system that runs the day-to-day operations of a small engineering
-business, with an AI assistant doing the work and ordinary code checking
-that the work was actually done.
+This is the operations system I built for Splatt Engineering, a small NZ
+company that supplies and services bottling and food-processing machines.
+It runs the admin side of the business: jobs, quotes, invoices, follow-ups,
+and the Todoist board everything hangs off.
 
-> This is a public copy of a system in real daily use. All client,
-> supplier and people names, prices and reference numbers have been
-> replaced with made-up ones.
+Claude does a lot of the day-to-day work through MCP tools. A separate
+validator then checks that work, and it doesn't take Claude's word for
+anything.
 
-## What it is
+> This is a public copy of a system that's in daily use, so every client,
+> supplier, person, price and reference number has been swapped for
+> made-up data.
 
-Splatt Engineering supplies and services machines for bottling and food
-factories. Most of its work starts as an email: a client asks for a price,
-a supplier sends a quote, a delivery arrives. Each email means updating
-several places: the to-do list (Todoist), the customer records, the
-project files and the accounts (Xero).
+## Why it's built this way
 
-This project connects all of those. It has:
+The first version was a pile of scripts writing to PocketBase from
+different places. One of them, the client sync, failed on every record
+for months and nothing flagged it, because the code reported a write as
+done without checking that it had actually landed.
 
-- **a database** of clients, jobs, quotes and invoices,
-- **a background program** that keeps the to-do list and the database in
-  sync and follows up on work that is running late,
-- **a dashboard** that shows everything in one place,
-- **an AI assistant** (Claude) that reads the email and does the updates,
-- **a checker** that confirms the assistant's work is really done.
+That shaped everything after it. An AI agent has the same failure mode,
+just more often. It will tell you it updated a job when the write was
+rejected, or skip a step and still call the run finished. But it's very
+good at the part plain code can't do, which is reading an email thread
+and working out what actually happened.
 
-## The problem it solves
+So Claude does the reading and deciding, and plain Python checks the
+result. The agent never gets to decide whether it succeeded.
 
-An AI assistant is good at understanding things. It can read a long email
-thread and work out that "yes, go ahead with option B" means the client
-accepted the quote.
-
-But it is not reliable at bookkeeping. It can:
-
-- say it saved something when the save failed,
-- skip a step and not notice,
-- report "all done" because it *remembers* doing the work, not because it
-  checked.
-
-Ordinary code is the opposite: it cannot read an email, but it never skips
-a step and can check every claim. So this system gives each side the job
-it is good at.
-
-## How it works
+## How it fits together
 
 ```mermaid
-flowchart TB
-    A["1. Email arrives"] --> B["2. AI assistant reads it<br/>and decides what to do"]
-    B --> C["3. It makes changes<br/>using safe, limited tools"]
-    C --> D[("Database")]
-    E["Background program<br/>(runs every minute)"] --> D
-    D --> F["4. Checker looks at the result<br/>against 36 business rules"]
-    F -- "pass or fail" --> G["5. The assistant reports<br/>what the checker found"]
-    F --> H["Alert to the owner's phone"]
+flowchart LR
+    Gmail --> Claude
+    Claude -- MCP tools --> PocketBase[(PocketBase)]
+    Todoist <--> Daemon <--> PocketBase
+    PocketBase --> Validator
+    Validator -- "pass / fail" --> Claude
+    Validator --> Telegram
 ```
 
-1. **An email arrives.** The AI assistant reads it and decides what needs
-   to happen.
-2. **It makes the changes using limited tools.** It cannot write to the
-   database freely. Every save is checked before it is sent and read back
-   afterwards, so a failed save is reported as a failure.
-3. **Routine work is done by the background program,** not the assistant.
-   Every minute it syncs the to-do list with the database. Once a day it
-   moves overdue tasks up an escalation ladder: overdue after 1 day, marked
-   urgent after 3, an alert after 7, parked after 28.
-4. **At the end, a separate checker reviews the result.** It does not
-   trust anything the assistant says. It reads the database and the
-   project folders itself and applies 36 rules. For example: a job marked
-   "invoiced" must have an invoice, and freight paid to a courier must be
-   charged on to the client.
-5. **The assistant must report the checker's answer,** not its own
-   opinion. If the checker says something is wrong, the assistant is not
-   allowed to say the job is finished. The checker also sends its result
-   straight to the owner's phone (Telegram), so a problem cannot be hidden.
+Claude reads the email and makes changes through the MCP server
+(`mcp_server/`). Every write is checked against the schema before it's
+sent and read back afterwards, so a dropped write comes back as an error
+instead of "done".
 
-## What catches what
+The daemon (`daemon/`) runs every 60 seconds. It mirrors the Todoist board
+into PocketBase, moves a job forward when the task that finishes it is
+ticked off, and once a day escalates overdue tasks: flagged after 3 days,
+an alert after 7, parked as stalled after 28. Every write it makes goes
+into a ledger.
 
-| If the AI assistant... | ...this catches it |
+The validator (`validator/`) runs at the end of every agent session, and
+the daemon also runs it if the ops channel has been quiet for 12 hours. It re-reads the
+ledger, checks the 36 rules in `config/validation-rules.yaml`, and exits
+0 (pass), 1 (blocked) or 2 (couldn't run). Claude has to report that
+result rather than its own summary. The validator also posts straight to
+a Telegram channel, so a failed run can't just be left out of the report.
+
+Longer procedures, like filing a supplier quote, go through playbooks.
+That's a small state machine in `server/` that won't accept a step until
+the evidence for it checks out (the file exists, the record is there).
+
+Some examples of what the rules catch: a job marked invoiced with no
+invoice record, freight paid to a courier but never charged on to the
+client, a quote that's been sitting for a week with no follow-up.
+
+Where the code isn't sure, it refuses rather than guessing. If a task
+title matches two clients, it links neither and leaves it for Claude or
+me to sort out, and that decision then goes through the same checks as
+everything else.
+
+The longer version, including the gaps that still exist, is in
+[docs/HARNESSES.md](docs/HARNESSES.md). Every component is described in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+## Repo layout
+
+| Folder | What's in it |
 |---|---|
-| saves to a field that does not exist | the tool refuses the save and names the field |
-| says it saved something, but the save failed | the tool reads the record back and reports the failure |
-| skips a step in a multi-step job | the step-by-step "playbook" will not move on without proof |
-| marks a job as invoiced with no invoice | the checker's rules fail the job |
-| forgets to chase a client | the background program creates the reminder itself |
-| reports success while rules are failing | the checker blocks it and alerts the owner directly |
+| `core/` | PocketBase and Todoist clients, the write ledger, and the logic that matches tasks to clients and jobs |
+| `daemon/` | The background loop: sync, triggers, the overdue ladder, backups |
+| `validator/` | The validator. Its rules live in `config/validation-rules.yaml` |
+| `mcp_server/`, `playbook_mcp/` | The MCP servers Claude uses |
+| `skills/` | The instructions Claude follows |
+| `server/` | Node server for project files and playbooks |
+| `dashboard/` | The dashboard, a single HTML page (React, no build step) |
+| `tools/` | Demo data, Todoist setup, backups, schema tools |
+| `tests/` | Around 1,200 tests |
 
-When the code is unsure (for example, two clients have similar names), it
-does not guess. It leaves the decision to the assistant or the owner, and
-that decision is then checked like everything else.
+## Running the demo
 
-The full explanation is in **[docs/HARNESSES.md](docs/HARNESSES.md)**.
-
-## What's in this repository
-
-| Folder | What it holds |
-|---|---|
-| [`core/`](core/) | Shared code: talking to the database and Todoist, and the logic for matching tasks to clients and jobs |
-| [`daemon/`](daemon/) | The background program (sync, reminders, overdue ladder, backups) |
-| [`validator/`](validator/) | The checker. Its rules are in [`config/validation-rules.yaml`](config/validation-rules.yaml) |
-| [`mcp_server/`](mcp_server/), [`playbook_mcp/`](playbook_mcp/) | The limited tools the AI assistant is allowed to use |
-| [`skills/`](skills/) | The written instructions the AI assistant follows |
-| [`server/`](server/) | A small server for project files and step-by-step playbooks |
-| [`dashboard/`](dashboard/) | The dashboard (a single web page) |
-| [`tools/`](tools/) | Helper scripts: demo data, setup, backups |
-| [`tests/`](tests/) | About 1,200 automated tests |
-
-How the parts fit together: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
-
-## Try it
-
-You can run a demo with a made-up business in about 10 minutes, without
-any accounts. You need Python 3.10 or newer, Node.js 18 or newer, and the
-free PocketBase database program.
-
-Follow **Part A** of **[docs/INSTALL.md](docs/INSTALL.md)**. You will get
-the dashboard with sample clients, jobs, overdue tasks and a map of
-installed machines, and you can run the checker to see it find problems
-in the sample data.
-
-<details>
-<summary>Short version of the demo commands (macOS, Apple Silicon)</summary>
+The demo loads a made-up business into a local PocketBase, so you can see
+the dashboard and run the validator without any accounts. It takes about
+10 minutes. You'll need Python 3.10+, Node 18+ and the PocketBase binary.
+The full steps are in [docs/INSTALL.md](docs/INSTALL.md), Part A. The
+short version, on an Apple Silicon Mac:
 
 ```bash
 git clone https://github.com/michaelberns/splatt-ops-public.git && cd splatt-ops-public
@@ -139,28 +116,24 @@ open dashboard/index.html
 SPLATT_ROOT="$PWD/examples" .venv/bin/python -m validator run --no-todoist
 ```
 
-</details>
+The last command should come back BLOCKED. That's expected: the demo data
+has a few gaps in it (a job marked won with no quote on file, for one), and
+finding those is the validator's job.
 
-## Running the tests
+## Tests
 
 ```bash
 .venv/bin/python -m pytest
 ```
 
-The tests run offline, using fake versions of the database and Todoist.
+They run offline against a fake PocketBase and a fake Todoist in
+`tests/fakes.py`.
 
-## Built with
+## Stack
 
-Python, PocketBase (database), Node.js, React (dashboard), the Todoist and
-Telegram APIs, and Claude with the Model Context Protocol (MCP) for the AI
-assistant.
-
-## Further reading
-
-- [docs/INSTALL.md](docs/INSTALL.md): step-by-step setup, from demo to full use
-- [docs/HARNESSES.md](docs/HARNESSES.md): how the AI and the checker keep each other honest, and the current limitations
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): every part of the system in detail
+Python 3.12, PocketBase 0.25, Node 22, React 18 in a single HTML file,
+the Todoist and Telegram APIs, and Claude over MCP.
 
 ## Author
 
-Michael Berns. Built for and used at Splatt Engineering.
+Michael Berns
