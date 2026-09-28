@@ -107,6 +107,10 @@ def pin(offset):
 
 # ── The demo business ────────────────────────────────────────────────────
 #
+# Client addresses end in "| GPS: lat, lng". The dashboard's maps read the
+# coordinates from that tag (tools/geocode_clients.py adds it on a real
+# database), so the demo clients show up on the map without geocoding.
+#
 # Each list is (key, payload). The key is only used inside this script, to
 # let later records point at earlier ones with "@collection:key".
 
@@ -116,7 +120,7 @@ CLIENTS = [
         "aliases": "Clearwater Bottling NZ, Clearwater Bottling",
         "email_addresses": "clearwaterbottling.example.co.nz",
         "phone": "+64 7 000 0001",
-        "address": "10 Example Road, Hamilton 3200",
+        "address": "10 Example Road, Hamilton 3200 | GPS: -37.7870, 175.2793",
         "status": "active",
         "notes": "Bottled water and juice. Runs a Vela rotary filler on the main line.",
     }),
@@ -125,7 +129,7 @@ CLIENTS = [
         "aliases": "Orchard Lane, Orchard Lane Cromwell",
         "email_addresses": "orchardlane.example.co.nz",
         "phone": "+64 3 000 0002",
-        "address": "5 Sample Lane, Cromwell 9310",
+        "address": "5 Sample Lane, Cromwell 9310 | GPS: -45.0400, 169.1990",
         "status": "active",
         "notes": "Juice processor. Taponera capper; adding a 375 mL bottle.",
     }),
@@ -134,7 +138,7 @@ CLIENTS = [
         "aliases": "Hilltop, Hilltop Foods, Hill Top",
         "email_addresses": "hilltop.example.co.nz",
         "phone": "+64 7 000 0003",
-        "address": "22 Demo Street, Morrinsville 3300",
+        "address": "22 Demo Street, Morrinsville 3300 | GPS: -37.6567, 175.5303",
         "status": "active",
         "notes": "Sauces and dressings. Rialto rinser due for a refurbishment.",
     }),
@@ -143,7 +147,7 @@ CLIENTS = [
         "aliases": "Kauri",
         "email_addresses": "kaurisprings.example.com",
         "phone": "+64 7 000 0004",
-        "address": "12 Example Road, RD 2, Te Puke 3182",
+        "address": "12 Example Road, RD 2, Te Puke 3182 | GPS: -37.7850, 176.3260",
         "status": "active",
         "notes": "Spring water bottler. Filler upgraded this year.",
     }),
@@ -152,7 +156,7 @@ CLIENTS = [
         "aliases": "Tui Valley, Tui Valley NZ",
         "email_addresses": "tuivalley.example.com",
         "phone": "+64 7 000 0005",
-        "address": "8 Sample Court, Te Awamutu 3800",
+        "address": "8 Sample Court, Te Awamutu 3800 | GPS: -38.0100, 175.3250",
         "status": "prospect",
         "notes": "Prospect. Interested in a cap dryer once budget is approved.",
     }),
@@ -160,6 +164,7 @@ CLIENTS = [
         "name": "Kowhai Health NZ Ltd",
         "aliases": "Kowhai Health, KHNZ",
         "email_addresses": "kowhaihealth.example.co.nz",
+        "address": "30 Example Street, Tauranga 3110 | GPS: -37.6870, 176.1650",
         "status": "active",
         # A critical client is a sensitive account: the agent only reports
         # on it and never drafts anything (see skills/splatt-ss-agent).

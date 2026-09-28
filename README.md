@@ -12,6 +12,51 @@ separate validator checks that work afterwards.
 > supplier, person, price and reference number has been swapped for
 > made-up data.
 
+## What it looks like
+
+The dashboard is where I actually see all of this day to day. These
+screenshots are from the demo data, so every name in them is made up.
+
+![Dashboard](docs/images/dashboard.jpg)
+
+The home page: open and overdue tasks, what's due this week, and money in
+and out.
+
+![Projects map](docs/images/map.jpg)
+
+Every open project on a map, coloured by stage (quoting, quoted, won,
+invoicing). Useful for planning site visits.
+
+![Tasks map](docs/images/map-tasks.jpg)
+
+The same map switched to tasks, so overdue and waiting work shows up where
+the client is. Anything without an address is listed on the right so it
+doesn't get lost.
+
+![Client Intel](docs/images/clientintel.jpg)
+
+Client Intel is the equipment register: every machine installed or quoted
+at a client site, filtered by type and status. The Gaps tab lists clients
+with no machines on record.
+
+![Workload](docs/images/workload.jpg)
+
+Workload groups projects by client with their tasks underneath, and flags
+things like a missing invoice or shipping that still has to be charged.
+This is the page I work from.
+
+![Logs](docs/images/logs.jpg)
+
+Every service writes to `logs/`, and this page shows them. Here the
+validator has run twice: once blocked, once passed with warnings.
+
+![Playbooks](docs/images/playbooks.jpg)
+
+Playbook runs and how they ended. In the completed run, step 3 was
+rejected the first time because it claimed an email had been logged when
+the record wasn't in the database yet. The open run was started and never
+finished, which the validator flags if it's left too long.
+
 ## Two harnesses, one on top of the other
 
 The system is built as two harnesses. The agent harness controls what
