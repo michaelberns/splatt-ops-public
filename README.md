@@ -5,74 +5,81 @@ company that supplies and services bottling and food-processing machines.
 It runs the admin side of the business: jobs, quotes, invoices, follow-ups,
 and the Todoist board everything hangs off.
 
-Claude does a lot of the day-to-day work through MCP tools. A separate
-validator then checks that work, and it doesn't take Claude's word for
-anything.
+Claude does a lot of the day-to-day work through MCP tools, and a
+separate validator checks that work afterwards.
 
 > This is a public copy of a system that's in daily use, so every client,
 > supplier, person, price and reference number has been swapped for
 > made-up data.
 
-## Why it's built this way
+## Two harnesses, one on top of the other
 
-The first version was a pile of scripts writing to PocketBase from
-different places. One of them, the client sync, failed on every record
-for months and nothing flagged it, because the code reported a write as
-done without checking that it had actually landed.
-
-That shaped everything after it. An AI agent has the same failure mode,
-just more often. It will tell you it updated a job when the write was
-rejected, or skip a step and still call the run finished. But it's very
-good at the part plain code can't do, which is reading an email thread
-and working out what actually happened.
-
-So Claude does the reading and deciding, and plain Python checks the
-result. The agent never gets to decide whether it succeeded.
-
-## How it fits together
+The system is built as two harnesses. The agent harness controls what
+Claude can do while it works. The validator harness sits on top of it and
+checks the result afterwards, without trusting anything the agent says.
 
 ```mermaid
-flowchart LR
-    Gmail --> Claude
-    Claude -- MCP tools --> PocketBase[(PocketBase)]
-    Todoist <--> Daemon <--> PocketBase
-    PocketBase --> Validator
+flowchart TB
+    subgraph V["Validator harness"]
+        direction LR
+        Daemon --> Ledger
+        Ledger --> Validator
+        Validator --> Telegram
+    end
+    subgraph A["Agent harness"]
+        direction LR
+        Skills --> Claude
+        Claude --> MCP["MCP tools"]
+        Claude --> Playbooks
+    end
+    A --> DB[(PocketBase)]
+    V --> DB
     Validator -- "pass / fail" --> Claude
-    Validator --> Telegram
 ```
 
-Claude reads the email and makes changes through the MCP server
-(`mcp_server/`). Every write is checked against the schema before it's
-sent and read back afterwards, so a dropped write comes back as an error
-instead of "done".
+### The agent harness
 
-The daemon (`daemon/`) runs every 60 seconds. It mirrors the Todoist board
-into PocketBase, moves a job forward when the task that finishes it is
-ticked off, and once a day escalates overdue tasks: flagged after 3 days,
-an alert after 7, parked as stalled after 28. Every write it makes goes
-into a ledger.
+This is everything that shapes how Claude works.
 
-The validator (`validator/`) runs at the end of every agent session, and
-the daemon also runs it if the ops channel has been quiet for 12 hours. It re-reads the
-ledger, checks the 36 rules in `config/validation-rules.yaml`, and exits
-0 (pass), 1 (blocked) or 2 (couldn't run). Claude has to report that
-result rather than its own summary. The validator also posts straight to
-a Telegram channel, so a failed run can't just be left out of the report.
+- Skills (`skills/`) are the instructions Claude follows: what it may and
+  may not do (it never sends email, never creates invoices on its own),
+  and the order of an ops run.
+- The MCP server (`mcp_server/`) is the only way Claude can change the
+  database. Every write is checked against the schema before it's sent and
+  read back afterwards, so a failed write comes back as an error instead
+  of "done".
+- Playbooks (`server/`, reached through `playbook_mcp/`) handle longer
+  procedures like filing a supplier quote. Each step has to be done in
+  order, and the server won't accept a step until its evidence checks out
+  (the file exists, the record is there).
 
-Longer procedures, like filing a supplier quote, go through playbooks.
-That's a small state machine in `server/` that won't accept a step until
-the evidence for it checks out (the file exists, the record is there).
+### The validator harness
 
-Some examples of what the rules catch: a job marked invoiced with no
-invoice record, freight paid to a courier but never charged on to the
-client, a quote that's been sitting for a week with no follow-up.
+This is the layer on top. It doesn't care what the agent reports, only
+what's actually in the database, Todoist and the project folders.
 
-Where the code isn't sure, it refuses rather than guessing. If a task
-title matches two clients, it links neither and leaves it for Claude or
-me to sort out, and that decision then goes through the same checks as
-everything else.
+- The daemon (`daemon/`) runs every 60 seconds. It keeps Todoist and
+  PocketBase in sync, moves jobs forward when their tasks are done, and
+  escalates overdue work once a day. Every write it makes goes into a
+  ledger, so it can be checked later.
+- The validator (`validator/`) re-reads the ledger and checks the 36 rules
+  in `config/validation-rules.yaml`. For example: a job marked invoiced
+  needs an invoice record, and freight paid to a courier has to be charged
+  on to the client.
+- It exits 0 (pass), 1 (blocked) or 2 (couldn't run), and posts the result
+  straight to a Telegram channel.
 
-The longer version, including the gaps that still exist, is in
+### Where the two meet
+
+At the end of every run, Claude has to run the validator and report its
+result, not its own summary. If the validator says blocked, Claude can't
+call the job finished, and the Telegram message goes out either way.
+
+The daemon also runs the validator by itself if the ops channel has been
+quiet for 12 hours, so checking doesn't depend on the agent remembering
+to do it.
+
+More detail on both harnesses, including the gaps that still exist, is in
 [docs/HARNESSES.md](docs/HARNESSES.md). Every component is described in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
